@@ -1,0 +1,411 @@
+"""FastAPI app: routes, SSE stream, startup recovery."""
+import asyncio
+import base64
+import json
+import os
+import secrets
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from . import db, worker
+
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
+STATIC_DIR = Path(__file__).parent / "static"
+TERMINAL_STATUSES = ("done", "error", "canceled")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs(worker.DOWNLOADS_DIR, exist_ok=True)
+    await asyncio.to_thread(db.init_db)
+    n = await asyncio.to_thread(db.reset_stuck_jobs)
+    if n:
+        print(f"[startup] requeued {n} interrupted job(s)")
+
+    # 'separating' is deliberately excluded from reset_stuck_jobs (Phase 1):
+    # a job interrupted there has a complete source download on disk, and
+    # requeuing it from scratch throws that away. Resume in place if the
+    # source is still there; only demote to queued if it's gone.
+    sep_jobs = await asyncio.to_thread(db.get_jobs_by_status, "separating")
+    for job in sep_jobs:
+        if job.get("filepath") and os.path.exists(job["filepath"]):
+            asyncio.create_task(worker.resume_separation(job))
+        else:
+            await asyncio.to_thread(db.update_job, job["id"], status="queued", filepath=None)
+    if sep_jobs:
+        print(f"[startup] resumed/requeued {len(sep_jobs)} separating job(s)")
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(worker.queue_loop(stop_event))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        await task
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------- auth
+# Optional HTTP Basic auth, gated on APP_PASSWORD being set (unset by
+# default). Middleware rather than a route Depends so it also covers the
+# /files StaticFiles mount and the SSE stream, not just declared routes.
+@app.middleware("http")
+async def basic_auth(request: Request, call_next):
+    if APP_PASSWORD:
+        auth = request.headers.get("authorization", "")
+        ok = False
+        if auth.startswith("Basic "):
+            try:
+                _, _, pw = base64.b64decode(auth[6:]).decode().partition(":")
+                ok = secrets.compare_digest(pw, APP_PASSWORD)
+            except Exception:
+                ok = False
+        if not ok:
+            return Response(status_code=401, headers={"WWW-Authenticate": "Basic"})
+    return await call_next(request)
+
+
+# -------------------------------------------------------------- models
+
+class AddJobRequest(BaseModel):
+    url: str
+    kind: str = "video"
+    quality: str = "best"
+    subs: str | None = None
+    embed_subs: bool = True
+    strip_vocals: bool = False       # Phase 5 -- no-op unless kind='audio'
+    merge_subs: bool = False         # Phase 6a
+    sub_primary: str | None = None   # e.g. 'zh' -- top line
+    sub_secondary: str | None = None  # e.g. 'en' -- bottom line
+
+
+class BulkJobRequest(BaseModel):
+    text: str
+    kind: str = "video"
+    quality: str = "best"
+    subs: str | None = None
+    embed_subs: bool = True
+    strip_vocals: bool = False
+    merge_subs: bool = False
+    sub_primary: str | None = None
+    sub_secondary: str | None = None
+    force: bool = False
+
+
+class DeleteJobsRequest(BaseModel):
+    ids: list[int]
+    delete_files: bool = False
+
+
+class ProbeRequest(BaseModel):
+    url: str
+
+
+# ------------------------------------------------------------- helpers
+
+def _create_job(
+    url: str, kind: str, quality: str, subs: str | None, embed_subs: bool,
+    strip_vocals: bool = False, merge_subs: bool = False,
+    sub_primary: str | None = None, sub_secondary: str | None = None,
+) -> dict:
+    """Playlist classification is explicit, done at insert time -- not
+    guessed at download time. Phase 1's noplaylist=True stays on every
+    single-video job; only a URL classified as a playlist up front becomes
+    a kind='playlist' parent row that the worker expands.
+
+    strip_vocals is a no-op on anything but kind='audio' -- clamp it here
+    rather than trust the client, same reasoning as kind being the only
+    source of truth for audio-vs-video."""
+    cls = worker.classify_url(url)
+    strip_vocals = bool(strip_vocals) and kind == "audio"
+    common = dict(
+        subs=subs, embed_subs=int(embed_subs), strip_vocals=int(strip_vocals),
+        merge_subs=int(bool(merge_subs)), sub_primary=sub_primary, sub_secondary=sub_secondary,
+    )
+    if cls == "playlist":
+        job_id = db.insert_job(
+            url=url, kind="playlist", quality=quality, child_kind=kind, status="queued", **common,
+        )
+    else:
+        job_id = db.insert_job(url=url, kind=kind, quality=quality, status="queued", **common)
+    return db.get_job(job_id)
+
+
+# -------------------------------------------------------------- routes
+
+@app.get("/")
+async def index():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/jobs")
+async def api_list_jobs():
+    return await asyncio.to_thread(db.get_jobs)
+
+
+@app.post("/api/jobs")
+async def api_add_job(req: AddJobRequest):
+    if not req.url.strip():
+        raise HTTPException(400, "url required")
+    return await asyncio.to_thread(
+        _create_job, req.url.strip(), req.kind, req.quality, req.subs, req.embed_subs,
+        req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary,
+    )
+
+
+@app.post("/api/jobs/bulk")
+async def api_bulk_add(req: BulkJobRequest):
+    existing = {j["url"] for j in await asyncio.to_thread(db.get_jobs)}
+    new_urls, dupes = worker.parse_bulk_urls(req.text, set() if req.force else existing)
+    added = []
+    for url in new_urls:
+        job = await asyncio.to_thread(
+            _create_job, url, req.kind, req.quality, req.subs, req.embed_subs,
+            req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary,
+        )
+        added.append(job)
+    return {"added": added, "duplicates": dupes}
+
+
+@app.post("/api/probe")
+async def api_probe(req: ProbeRequest):
+    try:
+        formats = await asyncio.to_thread(worker.probe_formats, req.url)
+    except Exception as e:
+        raise HTTPException(400, f"{type(e).__name__}: {e}")
+    return {"formats": formats}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def api_cancel(job_id: int):
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    await asyncio.to_thread(worker.request_cancel, job)
+    return await asyncio.to_thread(db.get_job, job_id)
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def api_retry(job_id: int):
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in ("error", "canceled"):
+        raise HTTPException(400, "only error/canceled jobs can be retried")
+    await asyncio.to_thread(
+        db.update_job, job_id, status="queued", error=None, progress=0,
+        log=None, stage=None, stage_i=None, stage_n=None, speed=None, eta=None,
+    )
+    return await asyncio.to_thread(db.get_job, job_id)
+
+
+@app.delete("/api/jobs/{job_id}")
+async def api_delete_one(job_id: int, file: int = 0):
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in TERMINAL_STATUSES:
+        await asyncio.to_thread(worker.request_cancel, job)
+    if file:
+        await asyncio.to_thread(worker.safe_delete_file, job.get("filepath"))
+    await asyncio.to_thread(db.delete_job, job_id)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/delete")
+async def api_delete_many(req: DeleteJobsRequest):
+    for jid in req.ids:
+        job = await asyncio.to_thread(db.get_job, jid)
+        if not job:
+            continue
+        if job["status"] not in TERMINAL_STATUSES:
+            await asyncio.to_thread(worker.request_cancel, job)
+        if req.delete_files:
+            await asyncio.to_thread(worker.safe_delete_file, job.get("filepath"))
+        await asyncio.to_thread(db.delete_job, jid)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/clear")
+async def api_clear_completed():
+    jobs = await asyncio.to_thread(db.get_jobs)
+    ids = [j["id"] for j in jobs if j["status"] in TERMINAL_STATUSES]
+    for jid in ids:
+        await asyncio.to_thread(db.delete_job, jid)
+    return {"ok": True, "cleared": len(ids)}
+
+
+@app.post("/api/jobs/{job_id}/expand")
+async def api_expand(job_id: int):
+    """Phase 4 gap: a watch?v=X&list=Y URL is classified as a single video
+    by design (the common accident) -- this lets the user override that
+    call after the fact. Reclassifies the row as kind='playlist' and puts
+    it back on the queue so the *existing* claim/dispatch path expands it
+    exactly like a playlist submitted fresh -- no separate expansion
+    trigger to maintain. (The plan sketches setting status='expanding'
+    directly, but nothing polls for that status outside of _dispatch
+    reacting to a just-claimed 'queued' row, so that would sit inert until
+    a restart; 'queued' is the one status that actually gets picked up.)"""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job["kind"] == "playlist":
+        raise HTTPException(400, "already a playlist")
+    if job["status"] not in ("queued", "done", "error", "canceled"):
+        raise HTTPException(400, "job is currently active, cancel it first")
+    await asyncio.to_thread(
+        db.update_job, job_id, kind="playlist", child_kind=job["kind"],
+        status="queued", progress=0, error=None,
+    )
+    return await asyncio.to_thread(db.get_job, job_id)
+
+
+@app.post("/api/jobs/{job_id}/subtitle")
+async def api_upload_subtitle(
+    job_id: int, file: UploadFile = File(...), lang: str = Form(...),
+    offset_sec: float | None = Form(None),
+):
+    """Phase 6c: external subtitle upload, for when better subs come from a
+    subtitle site rather than the video itself. Unlike 6a (same yt-dlp
+    download, offset is 0 by construction), the offset here is genuinely
+    unknown -- auto_sync runs unless offset_sec pins it."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if not job.get("filepath"):
+        raise HTTPException(400, "job has no output yet")
+    if not lang.strip():
+        raise HTTPException(400, "lang required")
+
+    raw = await file.read()
+    text = await asyncio.to_thread(worker.decode_srt_bytes, raw)
+    orig_base = await asyncio.to_thread(worker.resolve_orig_base, job)
+    dest = f"{orig_base}.{lang.strip()}.srt"
+
+    def write_and_process():
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        logger = worker.JobLogger()
+        merged_srt = None
+        if job.get("merge_subs") and job.get("sub_primary") and job.get("sub_secondary"):
+            merged_srt = worker.merge_bilingual_subs(
+                job, orig_base, None, logger,
+                auto_sync=(offset_sec is None), manual_offset_sec=offset_sec,
+            )
+
+        # Re-mux is only attempted for audio outputs: the pre-mux audio
+        # sidecar is always still on disk (our mux step only ever writes a
+        # *new* .mkv), so it's safe to rebuild from scratch. A video job's
+        # .mkv was already muxed in place (Phase 6a) -- re-running against
+        # it would stack a second "X+Y" stream alongside the first rather
+        # than replacing it, so that case just refreshes the .srt on disk
+        # and leaves the container as-is; delete + retry for a clean remux.
+        out_filepath = None
+        if job["kind"] == "audio" and job.get("embed_subs"):
+            audio_src = worker.find_audio_source(job)
+            if audio_src:
+                sub_tracks = worker.collect_sub_tracks(job, orig_base, merged_srt)
+                if sub_tracks:
+                    stem = os.path.splitext(audio_src)[0]
+                    out_path = stem + ".mkv"
+                    worker.run_mux(audio_src, sub_tracks, out_path, False)
+                    out_filepath = out_path
+        return merged_srt, out_filepath, logger.dump()
+
+    merged_srt, out_filepath, log_text = await asyncio.to_thread(write_and_process)
+    update = {}
+    if out_filepath:
+        update["filepath"] = out_filepath
+    if log_text:
+        prior = job.get("log") or ""
+        update["log"] = (prior + "\n" + log_text)[-8192:]
+    if update:
+        await asyncio.to_thread(db.update_job, job_id, **update)
+    return await asyncio.to_thread(db.get_job, job_id)
+
+
+@app.get("/api/cookies")
+async def api_cookies_status():
+    """No server-side login flow exists for this -- Google killed the
+    device-code OAuth path yt-dlp used to offer, so a cookies.txt exported
+    from a real logged-in browser session is the only way in. This endpoint
+    just removes the SSH/scp step: paste or upload that file here instead
+    of onto the NAS by hand, from any device including a phone."""
+    path = worker.YTDLP_COOKIES
+    if not path:
+        return {"configured": False}
+    exists = os.path.exists(path)
+    return {
+        "configured": True,
+        "path": path,
+        "exists": exists,
+        "updated_at": os.path.getmtime(path) if exists else None,
+    }
+
+
+@app.post("/api/cookies")
+async def api_cookies_upload(
+    file: UploadFile | None = File(None), text: str | None = Form(None),
+):
+    path = worker.YTDLP_COOKIES
+    if not path:
+        raise HTTPException(400, "YTDLP_COOKIES is not set for this container")
+
+    if file is not None:
+        raw = await file.read()
+        content = raw.decode("utf-8", errors="replace")
+    elif text is not None and text.strip():
+        content = text
+    else:
+        raise HTTPException(400, "provide a file or pasted text")
+
+    # Loose sanity check, not a strict parse -- catches the "pasted the
+    # wrong thing" case (an HTML page, a DevTools cookie-header string)
+    # without being fussy about which exporter produced the file.
+    head = content.lstrip()[:4096]
+    if "\tTRUE\t" not in head and "\tFALSE\t" not in head and "Netscape" not in head:
+        raise HTTPException(
+            400,
+            "doesn't look like a Netscape-format cookies.txt "
+            "(export with a 'cookies.txt' browser extension, not copy-pasted headers)",
+        )
+
+    def write():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    await asyncio.to_thread(write)
+    return await api_cookies_status()
+
+
+@app.get("/api/events")
+async def api_events():
+    async def gen():
+        while True:
+            jobs = await asyncio.to_thread(db.get_jobs)
+            active = [j for j in jobs if j["status"] not in TERMINAL_STATUSES]
+            for j in active:
+                j.pop("log", None)  # keep the tick small; log is fetched via /api/jobs
+            yield f"data: {json.dumps(active)}\n\n"
+            await asyncio.sleep(1)
+
+    # X-Accel-Buffering: no -- so a reverse proxy in front of this doesn't
+    # buffer the stream and freeze progress while downloads keep running.
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+
+# StaticFiles requires the directory to exist at mount (import) time, before
+# the lifespan startup hook has a chance to create it.
+os.makedirs(worker.DOWNLOADS_DIR, exist_ok=True)
+app.mount("/files", StaticFiles(directory=worker.DOWNLOADS_DIR), name="files")

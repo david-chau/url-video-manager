@@ -1,0 +1,17 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# yt-dlp is deliberately unpinned: YouTube breaks extractors on the order of
+# monthly, and a pinned version silently rots into "everything fails". The
+# Dockerfile entrypoint runs `pip install -U yt-dlp` before every start, so
+# `docker compose restart` is always the first fix to try.
+yt-dlp
+
+# Phase 6: vendored app/merge_srt.py (bilingual subtitle merge) uses pysrt.
+# charset_normalizer is already a transitive dep of requests/yt-dlp, but the
+# 6c upload path depends on it directly now for GBK/BIG5 .srt sniffing, so
+# it's pinned as a direct requirement rather than riding along silently.
+pysrt
+charset-normalizer
+
+# multipart form parsing for the 6c subtitle-upload endpoint.
+python-multipart

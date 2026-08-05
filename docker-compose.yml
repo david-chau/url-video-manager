@@ -1,0 +1,30 @@
+# Image is built + pushed from the Mac (linux/amd64, for the NAS's Celeron):
+#   docker buildx build --platform linux/amd64 --build-arg WITH_DEMUCS=false \
+#     -t ghcr.io/david-chau/url-video-manager:latest --push .
+# NAS side is pull-only:
+#   docker compose pull && docker compose up -d
+# Vocal separation (Phase 5) needs a WITH_DEMUCS=true build (~2GB torch) --
+# check the plan's Synology section first, non-AVX CPUs can't run torch at
+# all. Tag that build :demucs rather than overwriting :latest.
+services:
+  app:
+    image: ghcr.io/david-chau/url-video-manager:latest
+    ports:
+      # All interfaces, not 127.0.0.1: a loopback bind on a headless NAS is
+      # only reachable from the NAS itself.
+      - "8080:8080"
+    volumes:
+      - ./downloads:/downloads
+      - ./data:/data
+    environment:
+      MAX_CONCURRENT: "2"
+      SEPARATION_SLOTS: "1"     # demucs is CPU/RAM-heavy; its own semaphore, independent of MAX_CONCURRENT
+      DEMUCS_MODEL: "htdemucs"  # mdx_extra_q is faster/lower-quality if htdemucs is too slow
+      KEEP_VOCALS: ""           # unset = discard the isolated vocal track; set "1" to keep it alongside novocals
+      AUDIO_FORMAT: ""          # unset = passthrough (keep source m4a/opus); set "mp3" to force re-encode
+      YTDLP_COOKIES: "/data/cookies.txt"
+      APP_PASSWORD: ""          # unset by default; set to require HTTP Basic auth on every route
+    # On Synology, uncomment and set to your `id <you>` uid:gid (usually the
+    # `users` group, 100) so downloads aren't root-owned in the shared folder.
+    # user: "1026:100"
+    restart: unless-stopped

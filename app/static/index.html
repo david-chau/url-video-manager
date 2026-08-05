@@ -1,0 +1,516 @@
+<title>URL Video Manager</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 16px;
+    color: #222;
+    background: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #ddd; background: #1a1a1a; }
+    input, select, textarea, button { background: #2a2a2a; color: #ddd; border-color: #444 !important; }
+    table { border-color: #333 !important; }
+    th, td { border-color: #333 !important; }
+    .panel { background: #222 !important; border-color: #333 !important; }
+    .bar { background: #333 !important; }
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; display: flex; justify-content: space-between; align-items: baseline; }
+  #counts { font-size: 13px; font-weight: normal; color: #888; }
+  .panel { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+  textarea { width: 100%; min-height: 70px; font: 13px/1.4 ui-monospace, monospace; padding: 6px; border: 1px solid #ccc; border-radius: 4px; resize: vertical; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  .controls label { display: flex; align-items: center; gap: 4px; font-size: 13px; }
+  select, input[type=text] { padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; }
+  button { padding: 5px 12px; border: 1px solid #ccc; border-radius: 4px; background: #fff; cursor: pointer; font-size: 13px; }
+  button:hover { background: #eee; }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  button.primary:hover { background: #1d4ed8; }
+  button.danger { color: #b91c1c; }
+  .spacer { flex: 1; }
+  table { width: 100%; border-collapse: collapse; background: #fff; }
+  th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; vertical-align: middle; }
+  th { color: #888; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  tr.child td:first-of-type { padding-left: 28px; }
+  .bar { width: 140px; height: 8px; background: #eee; border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .bar > div { height: 100%; background: #2563eb; transition: width .3s; }
+  .status { padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+  .status-done { color: #15803d; }
+  .status-error { color: #b91c1c; }
+  .status-canceled { color: #b45309; }
+  .status-running, .status-expanding, .status-muxing, .status-separating { color: #2563eb; }
+  .status-queued { color: #666; }
+  .meta { color: #888; font-size: 12px; }
+  .row-actions button { margin-right: 4px; }
+  #probeResults { margin-top: 8px; max-height: 220px; overflow-y: auto; display: none; }
+  #probeResults table { font-size: 12px; }
+  #probeResults tr { cursor: pointer; }
+  #probeResults tr:hover { background: #f0f4ff; }
+  footer { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .hint { color: #888; font-size: 12px; }
+</style>
+
+<h1>URL Video Manager <span id="counts"></span></h1>
+
+<div class="panel" id="cookiesPanel">
+  <div class="controls" style="margin-top:0">
+    <strong style="font-size:13px">Cookies</strong>
+    <span class="meta" id="cookiesStatus">checking&hellip;</span>
+    <span class="spacer"></span>
+    <button id="cookiesToggle" type="button">Update&hellip;</button>
+  </div>
+  <div id="cookiesForm" style="display:none; margin-top:8px">
+    <p class="hint" style="margin:0 0 6px">
+      No auto-login exists for this &mdash; Google killed the OAuth flow yt-dlp used to use.
+      Export <code>cookies.txt</code> from a real signed-in browser session, then paste or
+      upload it here. Use a throwaway Google account if you can &mdash; scripted cookie use
+      carries ban risk.
+      <br><br>
+      <strong>How long they last:</strong> typically 2 weeks to a few months, not fixed.
+      YouTube actively rotates cookies on any tab left open, which kills an exported copy
+      early &mdash; export from an incognito/private window, close it right after signing in,
+      and don't reopen youtube.com in it. If jobs start failing with "sign in to confirm
+      you're not a bot", that's your signal to re-export.
+    </p>
+    <details style="margin:0 0 8px">
+      <summary style="cursor:pointer; font-size:12px; color:#2563eb">How do I get cookies.txt?</summary>
+      <div class="hint" style="margin-top:6px; line-height:1.6">
+        <strong>Desktop</strong><br>
+        Firefox &mdash; <a href="https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/" target="_blank" rel="noopener">cookies.txt</a> addon.<br>
+        Chrome &mdash; <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank" rel="noopener">Get cookies.txt LOCALLY</a>
+        (the plain "Get cookies.txt", no LOCALLY, was pulled from the Chrome Web Store as malware &mdash; don't use that one).<br>
+        Sign into YouTube, click the extension, export, paste the contents above.
+        <br><br>
+        <strong>Mobile</strong><br>
+        Android &mdash; install Firefox, then the
+        <a href="https://addons.mozilla.org/en-US/android/addon/yt-dlp-cookie-exporter/" target="_blank" rel="noopener">YT-DLP Cookie Exporter</a>
+        addon inside it. Sign into YouTube, export, paste.<br>
+        iOS &mdash; install <a href="https://apps.apple.com/us/app/cookie-editor/id6446215341" target="_blank" rel="noopener">Cookie-Editor</a>
+        from the App Store, enable it in Settings &rarr; Safari &rarr; Extensions. Sign into
+        YouTube in Safari, open Cookie-Editor from the address bar, export as Netscape format, paste.<br>
+        Chrome for iOS doesn't support this &mdash; it's WebKit underneath either way, use Safari.
+      </div>
+    </details>
+    <textarea id="cookiesText" placeholder="paste the contents of cookies.txt here" style="min-height:90px; font-size:12px"></textarea>
+    <div class="controls">
+      <input type="file" id="cookiesFileInput" accept=".txt">
+      <span class="spacer"></span>
+      <button id="cookiesCancel" type="button">Cancel</button>
+      <button id="cookiesSave" class="primary" type="button">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <textarea id="urls" placeholder="paste one URL per line, or a playlist URL"></textarea>
+  <div class="controls">
+    <select id="quality">
+      <option value="best">best</option>
+      <option value="1080">1080p</option>
+      <option value="720" selected>720p</option>
+      <option value="480">480p</option>
+    </select>
+    <select id="kind">
+      <option value="video" selected>video</option>
+      <option value="audio">audio only</option>
+    </select>
+    <label>subs: <input type="text" id="subs" placeholder="en,pt" size="10"></label>
+    <label><input type="checkbox" id="embedSubs" checked> embed</label>
+    <label id="stripVocalsLabel"><input type="checkbox" id="stripVocals" disabled> strip vocals</label>
+    <span class="spacer"></span>
+    <button id="probeBtn">Probe formats&hellip;</button>
+    <button id="addBtn" class="primary">Add</button>
+  </div>
+  <div class="controls">
+    <label><input type="checkbox" id="mergeSubs" disabled> merge bilingual</label>
+    <label>top: <select id="subPrimary" disabled></select></label>
+    <label>bottom: <select id="subSecondary" disabled></select></label>
+  </div>
+  <div id="probeResults"></div>
+</div>
+
+<input type="file" id="subFileInput" accept=".srt" style="display:none">
+
+<table id="jobsTable">
+  <thead>
+    <tr>
+      <th style="width:24px"><input type="checkbox" id="selectAll"></th>
+      <th>Title</th>
+      <th style="width:110px">Status</th>
+      <th style="width:180px">Progress</th>
+      <th style="width:170px">Actions</th>
+    </tr>
+  </thead>
+  <tbody id="jobsBody"></tbody>
+</table>
+
+<footer>
+  <button id="deleteSelected" class="danger">Delete selected</button>
+  <label><input type="checkbox" id="alsoDeleteFiles"> also delete files</label>
+  <span class="spacer"></span>
+  <button id="clearCompleted">Clear completed</button>
+</footer>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+const jobsBody = $('#jobsBody');
+
+let jobs = [];          // full flat list, latest known state, keyed by id
+let jobsById = new Map();
+let activeIds = new Set();
+let probeUrl = null;
+
+function bytesHuman(n) {
+  if (!n) return '';
+  const units = ['B','KB','MB','GB'];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(1)}${units[i]}`;
+}
+
+function fileUrl(filepath) {
+  if (!filepath) return null;
+  const rel = filepath.replace(/^\/downloads\//, '');
+  return '/files/' + rel.split('/').map(encodeURIComponent).join('/');
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { msg = (await res.json()).detail || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+async function loadJobs() {
+  jobs = await api('/api/jobs');
+  jobsById = new Map(jobs.map(j => [j.id, j]));
+  render();
+}
+
+function mergeTick(active) {
+  const newActive = new Set();
+  for (const partial of active) {
+    newActive.add(partial.id);
+    const existing = jobsById.get(partial.id);
+    if (existing) Object.assign(existing, partial);
+  }
+  // anything that *was* active but isn't anymore just finished/errored/was
+  // deleted elsewhere -- go get its real terminal state instead of guessing.
+  let needsRefresh = false;
+  for (const id of activeIds) {
+    if (!newActive.has(id)) needsRefresh = true;
+  }
+  activeIds = newActive;
+  if (needsRefresh) { loadJobs(); } else { render(); }
+}
+
+function statusLabel(j) {
+  if (j.status === 'done' && j.kind === 'playlist') {
+    const n = jobs.filter(x => x.parent_id === j.id).length;
+    return `done`;
+  }
+  return j.status;
+}
+
+function progressCell(j) {
+  if (j.kind === 'playlist') {
+    if (j.status === 'expanding') return '<span class="meta">expanding&hellip;</span>';
+    const n = jobs.filter(x => x.parent_id === j.id).length;
+    return `<span class="meta">${n} item${n === 1 ? '' : 's'}</span>`;
+  }
+  if (j.status === 'done') {
+    return `<span class="meta">&#10003; ${bytesHuman(j.filesize) || 'done'}</span>`;
+  }
+  if (j.status === 'error') {
+    return `<span class="meta" title="${escapeHtml(j.error || '')}">${escapeHtml((j.error || '').slice(0, 40))}</span>`;
+  }
+  if (j.status === 'canceled') return '<span class="meta">canceled</span>';
+  if (j.status === 'queued') return '<span class="meta">&ndash;</span>';
+  const pct = Math.max(0, Math.min(100, j.progress || 0));
+  const sub = [j.stage, j.speed, j.eta ? `eta ${j.eta}` : null].filter(Boolean).join(' &middot; ');
+  return `<div class="bar"><div style="width:${pct}%"></div></div> ${pct.toFixed(0)}%<br><span class="meta">${sub}</span>`;
+}
+
+function actionsCell(j) {
+  const btns = [];
+  if (j.status === 'queued') {
+    btns.push(`<button data-act="cancel" data-id="${j.id}">Cancel</button>`);
+    btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
+  } else if (['running', 'expanding', 'muxing', 'separating'].includes(j.status)) {
+    btns.push(`<button data-act="cancel" data-id="${j.id}">Cancel</button>`);
+  } else if (j.status === 'done') {
+    const url = fileUrl(j.filepath);
+    if (url) btns.push(`<a href="${url}" target="_blank"><button>Open</button></a>`);
+    btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
+  } else if (['error', 'canceled'].includes(j.status)) {
+    btns.push(`<button data-act="retry" data-id="${j.id}">Retry</button>`);
+    btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
+  }
+  // "this is a playlist, expand it" -- for a watch?v=X&list=Y URL that got
+  // classified as a single video by accident (Phase 4 gap).
+  if (j.kind !== 'playlist' && !j.parent_id && ['queued', 'done', 'error', 'canceled'].includes(j.status)) {
+    btns.push(`<button data-act="expand" data-id="${j.id}" title="Reclassify as a playlist and expand it">Expand</button>`);
+  }
+  // external subtitle upload (Phase 6c) -- only makes sense once there's an
+  // output to mux into.
+  if (j.kind !== 'playlist' && j.status === 'done') {
+    btns.push(`<button data-act="upload-sub" data-id="${j.id}">Upload subs&hellip;</button>`);
+  }
+  return `<span class="row-actions">${btns.join('')}</span>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function render() {
+  const parents = jobs.filter(j => !j.parent_id);
+  const rows = [];
+  for (const p of parents) {
+    rows.push(rowHtml(p, false));
+    if (p.kind === 'playlist') {
+      for (const c of jobs.filter(x => x.parent_id === p.id)) rows.push(rowHtml(c, true));
+    }
+  }
+  jobsBody.innerHTML = rows.join('') || '<tr><td colspan="5" class="meta">No jobs yet.</td></tr>';
+
+  const running = jobs.filter(j => j.status === 'running').length;
+  const queued = jobs.filter(j => j.status === 'queued').length;
+  $('#counts').textContent = `${running} running · ${queued} queued`;
+}
+
+function rowHtml(j, isChild) {
+  const title = escapeHtml(j.title || j.url);
+  const prefix = isChild ? '└ ' : (j.kind === 'playlist' ? '▾ ' : '');
+  return `<tr class="${isChild ? 'child' : ''}" data-row-id="${j.id}">
+    <td><input type="checkbox" class="rowcheck" data-id="${j.id}"></td>
+    <td>${prefix}${title}</td>
+    <td><span class="status status-${j.status}">${statusLabel(j)}</span></td>
+    <td>${progressCell(j)}</td>
+    <td>${actionsCell(j)}</td>
+  </tr>`;
+}
+
+let pendingSubUploadId = null;
+
+jobsBody.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  const act = btn.dataset.act;
+  try {
+    if (act === 'cancel') await api(`/api/jobs/${id}/cancel`, { method: 'POST' });
+    if (act === 'retry') await api(`/api/jobs/${id}/retry`, { method: 'POST' });
+    if (act === 'delete') await api(`/api/jobs/${id}?file=0`, { method: 'DELETE' });
+    if (act === 'expand') {
+      if (!confirm('Reclassify this job as a playlist and expand it?')) return;
+      await api(`/api/jobs/${id}/expand`, { method: 'POST' });
+    }
+    if (act === 'upload-sub') {
+      pendingSubUploadId = id;
+      $('#subFileInput').click();
+      return; // upload itself happens in the file input's change handler
+    }
+  } catch (err) { alert(err.message); }
+  loadJobs();
+});
+
+$('#subFileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file || !pendingSubUploadId) return;
+  const id = pendingSubUploadId;
+  pendingSubUploadId = null;
+  const lang = prompt('Language code for this track (e.g. zh, en):');
+  if (!lang) return;
+  const offsetStr = prompt('Manual offset in seconds (blank = auto-detect):', '');
+  const body = new FormData();
+  body.append('file', file);
+  body.append('lang', lang.trim());
+  if (offsetStr && offsetStr.trim()) body.append('offset_sec', offsetStr.trim());
+  try {
+    await api(`/api/jobs/${id}/subtitle`, { method: 'POST', body });
+  } catch (err) { alert(err.message); }
+  loadJobs();
+});
+
+$('#selectAll').addEventListener('change', (e) => {
+  document.querySelectorAll('.rowcheck').forEach(cb => cb.checked = e.target.checked);
+});
+
+$('#deleteSelected').addEventListener('click', async () => {
+  const ids = [...document.querySelectorAll('.rowcheck:checked')].map(cb => Number(cb.dataset.id));
+  if (!ids.length) return;
+  const deleteFiles = $('#alsoDeleteFiles').checked;
+  if (!confirm(`Delete ${ids.length} job(s)${deleteFiles ? ' and their files' : ''}?`)) return;
+  await api('/api/jobs/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids, delete_files: deleteFiles }),
+  });
+  loadJobs();
+});
+
+$('#clearCompleted').addEventListener('click', async () => {
+  await api('/api/jobs/clear', { method: 'POST' });
+  loadJobs();
+});
+
+function subLangs() {
+  return $('#subs').value.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// strip vocals only makes sense for audio jobs; merge bilingual needs at
+// least two requested subtitle languages to pick a top/bottom from.
+function updateFormState() {
+  const isAudio = $('#kind').value === 'audio';
+  const stripEl = $('#stripVocals');
+  stripEl.disabled = !isAudio;
+  if (!isAudio) stripEl.checked = false;
+
+  const langs = subLangs();
+  const canMerge = langs.length >= 2;
+  const mergeEl = $('#mergeSubs');
+  const pEl = $('#subPrimary'), sEl = $('#subSecondary');
+  mergeEl.disabled = !canMerge;
+  pEl.disabled = sEl.disabled = !canMerge;
+  if (!canMerge) { mergeEl.checked = false; }
+
+  const opts = langs.map(l => `<option value="${escapeHtml(l)}">${escapeHtml(l)}</option>`).join('');
+  pEl.innerHTML = opts;
+  sEl.innerHTML = opts;
+  if (langs.length >= 2) { pEl.value = langs[0]; sEl.value = langs[1]; }
+}
+
+$('#kind').addEventListener('change', updateFormState);
+$('#subs').addEventListener('input', updateFormState);
+updateFormState();
+
+function formValues() {
+  return {
+    kind: $('#kind').value,
+    quality: $('#quality').value,
+    subs: $('#subs').value.trim() || null,
+    embed_subs: $('#embedSubs').checked,
+    strip_vocals: $('#stripVocals').checked,
+    merge_subs: $('#mergeSubs').checked,
+    sub_primary: $('#mergeSubs').checked ? $('#subPrimary').value : null,
+    sub_secondary: $('#mergeSubs').checked ? $('#subSecondary').value : null,
+  };
+}
+
+$('#addBtn').addEventListener('click', async () => {
+  const text = $('#urls').value;
+  if (!text.trim()) return;
+  const body = { text, ...formValues() };
+  try {
+    const res = await api('/api/jobs/bulk', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (res.duplicates && res.duplicates.length) {
+      const list = res.duplicates.join('\n');
+      if (confirm(`${res.duplicates.length} URL(s) already in the table:\n${list}\n\nAdd anyway?`)) {
+        await api('/api/jobs/bulk', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: list, ...formValues(), force: true }),
+        });
+      }
+    }
+    $('#urls').value = '';
+    $('#probeResults').style.display = 'none';
+  } catch (err) { alert(err.message); }
+  loadJobs();
+});
+
+$('#probeBtn').addEventListener('click', async () => {
+  const firstLine = $('#urls').value.split('\n').map(s => s.trim()).find(Boolean);
+  if (!firstLine) { alert('Paste a URL first.'); return; }
+  probeUrl = firstLine;
+  const el = $('#probeResults');
+  el.style.display = 'block';
+  el.innerHTML = '<span class="meta">Probing&hellip;</span>';
+  try {
+    const { formats } = await api('/api/probe', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: firstLine }),
+    });
+    if (!formats.length) { el.innerHTML = '<span class="meta">No formats found.</span>'; return; }
+    const rows = formats.map(f => `<tr data-fmt="${f.format_id}">
+      <td>${f.format_id}</td><td>${f.ext || ''}</td>
+      <td>${f.height ? f.height + 'p' : (f.vcodec === 'none' ? 'audio' : '')}</td>
+      <td>${f.fps || ''}</td><td>${bytesHuman(f.filesize)}</td>
+      <td>${f.vcodec === 'none' ? f.acodec : f.vcodec}</td>
+      <td>${f.note || ''}</td>
+    </tr>`).join('');
+    el.innerHTML = `<table><thead><tr><th>id</th><th>ext</th><th>res</th><th>fps</th><th>size</th><th>codec</th><th>note</th></tr></thead><tbody>${rows}</tbody></table>`;
+  } catch (err) {
+    el.innerHTML = `<span class="meta">${escapeHtml(err.message)}</span>`;
+  }
+});
+
+$('#probeResults').addEventListener('click', async (e) => {
+  const tr = e.target.closest('tr[data-fmt]');
+  if (!tr || !probeUrl) return;
+  try {
+    await api('/api/jobs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: probeUrl, kind: $('#kind').value, quality: `fmt:${tr.dataset.fmt}`, subs: $('#subs').value.trim() || null, embed_subs: $('#embedSubs').checked }),
+    });
+    $('#probeResults').style.display = 'none';
+    $('#urls').value = '';
+  } catch (err) { alert(err.message); }
+  loadJobs();
+});
+
+async function loadCookiesStatus() {
+  const el = $('#cookiesStatus');
+  try {
+    const s = await api('/api/cookies');
+    if (!s.configured) { el.textContent = 'YTDLP_COOKIES not set on this container'; return; }
+    if (!s.exists) { el.textContent = 'not set'; return; }
+    const age = Date.now() / 1000 - s.updated_at;
+    const ageStr = age < 3600 ? `${Math.round(age / 60)}m ago` : `${Math.round(age / 3600)}h ago`;
+    el.textContent = `set, updated ${ageStr}`;
+  } catch (err) { el.textContent = err.message; }
+}
+
+$('#cookiesToggle').addEventListener('click', () => {
+  const f = $('#cookiesForm');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+});
+$('#cookiesCancel').addEventListener('click', () => {
+  $('#cookiesForm').style.display = 'none';
+  $('#cookiesText').value = '';
+  $('#cookiesFileInput').value = '';
+});
+$('#cookiesSave').addEventListener('click', async () => {
+  const file = $('#cookiesFileInput').files[0];
+  const text = $('#cookiesText').value;
+  if (!file && !text.trim()) { alert('Paste the cookies.txt contents or choose a file.'); return; }
+  const body = new FormData();
+  if (file) body.append('file', file);
+  else body.append('text', text);
+  try {
+    await api('/api/cookies', { method: 'POST', body });
+    $('#cookiesForm').style.display = 'none';
+    $('#cookiesText').value = '';
+    $('#cookiesFileInput').value = '';
+    loadCookiesStatus();
+  } catch (err) { alert(err.message); }
+});
+loadCookiesStatus();
+
+function connectEvents() {
+  const es = new EventSource('/api/events');
+  es.onmessage = (e) => mergeTick(JSON.parse(e.data));
+  es.onerror = () => { /* EventSource auto-reconnects */ };
+}
+
+loadJobs().then(connectEvents);
+</script>
