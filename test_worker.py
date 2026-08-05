@@ -28,15 +28,35 @@ def fresh_db():
 # --------------------------------------------------------------------- P1
 
 def test_p1_format_presets():
-    assert worker.build_format("video", "best") == "bv*+ba/b"
-    assert worker.build_format("video", "1080") == "bv*[height<=1080]+ba/b[height<=1080]"
-    assert worker.build_format("video", "720") == "bv*[height<=720]+ba/b[height<=720]"
-    assert worker.build_format("video", "480") == "bv*[height<=480]+ba/b[height<=480]"
+    # default container is mp4: source streams prefer mp4/m4a first (avoids
+    # landing on webm just because that's what the highest-quality stream
+    # happens to be), falling all the way through to an unrestricted
+    # bv*+ba/b only if nothing mp4-compatible exists.
+    assert worker.build_format("video", "best") == "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
+    assert worker.build_format("video", "1080") == (
+        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]"
+    )
+    assert worker.build_format("video", "720") == (
+        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]"
+    )
+    assert worker.build_format("video", "480") == (
+        "bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/bv*[height<=480]+ba/b[height<=480]"
+    )
+    # mkv gets the same mp4/m4a-preferring source selector as mp4 -- mkv
+    # accepts any codec, but the point is still to avoid webm when avoidable.
+    assert worker.build_format("video", "best", container="mkv") == worker.build_format("video", "best", container="mp4")
+    # explicit webm skips the preference and takes the best stream outright
+    # -- this is the old unconditional behavior, kept only for this choice.
+    assert worker.build_format("video", "best", container="webm") == "bv*+ba/b"
+    assert worker.build_format("video", "720", container="webm") == "bv*[height<=720]+ba/b[height<=720]"
     assert worker.build_format("video", "fmt:137") == "137"
-    # kind is the only source of truth for audio vs video -- quality is ignored
+    # kind is the only source of truth for audio vs video -- quality and
+    # container are both ignored (container is a video-only concept, gated
+    # in the UI the same way strip_vocals is gated to audio-only)
     assert worker.build_format("audio", "1080") == "ba/b"
     assert worker.build_format("audio", "best") == "ba/b"
-    print("ok: format presets")
+    assert worker.build_format("audio", "best", container="mkv") == "ba/b"
+    print("ok: format presets, mp4/mkv prefer mp4 sources, webm is opt-in")
 
 
 def test_p1_atomic_claim():
@@ -206,7 +226,25 @@ def test_p3_subtitle_opts():
     ydl_opts = worker.build_ydl_opts(job)
     assert ydl_opts["subtitleslangs"] == ["en", "pt"]
     assert {"key": "FFmpegEmbedSubtitle"} in ydl_opts["postprocessors"]
-    assert ydl_opts["merge_output_format"] == "mkv"
+    # no container specified -> defaults to mp4, and embedding respects it
+    # rather than always forcing mkv (that was the old, less flexible behavior)
+    assert ydl_opts["merge_output_format"] == "mp4"
+
+    mkv_job = dict(job, container="mkv")
+    assert worker.build_ydl_opts(mkv_job)["merge_output_format"] == "mkv"
+
+    # webm+subs falls back to mkv -- embedding into a raw .webm container is
+    # unreliable, and mkv holds VP9/Opus (webm's own codecs) natively so it
+    # loses nothing.
+    webm_job = dict(job, container="webm")
+    assert worker.build_ydl_opts(webm_job)["merge_output_format"] == "mkv"
+
+    # a plain video with no subtitles still gets remuxed to the chosen
+    # container -- this isn't conditional on subtitle embedding.
+    no_subs_job = {"id": 2, "kind": "video", "quality": "best", "subs": None, "embed_subs": 1, "parent_id": None}
+    assert worker.build_ydl_opts(no_subs_job)["merge_output_format"] == "mp4"
+    no_subs_webm = dict(no_subs_job, container="webm")
+    assert "merge_output_format" not in worker.build_ydl_opts(no_subs_webm)
 
     # embedding into a bare audio container isn't handled by yt-dlp's
     # FFmpegEmbedSubtitle -- Phase 6b's manual ffmpeg mux does that later.

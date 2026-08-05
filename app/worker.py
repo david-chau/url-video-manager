@@ -65,21 +65,34 @@ if not getattr(yt_dlp.utils.Popen, "_uvm_patched", False):
 
 # ------------------------------------------------------------------ presets
 
-FORMAT_PRESETS = {
-    "best": "bv*+ba/b",
-    "1080": "bv*[height<=1080]+ba/b[height<=1080]",
-    "720": "bv*[height<=720]+ba/b[height<=720]",
-    "480": "bv*[height<=480]+ba/b[height<=480]",
-}
+_HEIGHT_CAP = {"1080": 1080, "720": 720, "480": 480}  # "best": uncapped
+
+CONTAINER_CHOICES = ("mp4", "mkv", "webm")
 
 
-def build_format(kind: str, quality: str) -> str:
-    """kind is the only source of truth for audio vs video."""
+def build_format(kind: str, quality: str, container: str = "mp4") -> str:
+    """kind is the only source of truth for audio vs video.
+
+    container steers *source stream* preference, not just the output file
+    extension: on modern YouTube the highest-quality video-only streams are
+    almost always VP9/AV1 in webm, so an unfiltered `bv*+ba/b` selector
+    lands on webm by default regardless of what the merge step is asked to
+    produce. mp4/mkv here both prefer mp4+m4a (h264/aac) source streams
+    first -- those remux cleanly into either container with no re-encode --
+    and only fall through to an unrestricted `bv*+ba/b` (which may well be
+    webm) when nothing mp4-compatible exists at the requested quality.
+    Choosing container='webm' explicitly skips that preference and takes
+    the highest-quality stream outright, same as the old unconditional
+    behavior."""
     if kind == "audio":
         return "ba/b"
     if quality and quality.startswith("fmt:"):
         return quality.split(":", 1)[1]
-    return FORMAT_PRESETS.get(quality, FORMAT_PRESETS["best"])
+    cap = _HEIGHT_CAP.get(quality)
+    h = f"[height<={cap}]" if cap else ""
+    if container == "webm":
+        return f"bv*{h}+ba/b{h}"
+    return f"bv*{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/bv*{h}+ba/b{h}"
 
 
 # ------------------------------------------------------------- url classify
@@ -251,7 +264,8 @@ def make_progress_hook(job_id: int, stage_n_hint: int, flush_interval: float = 1
 
 def build_ydl_opts(job: dict, progress_hook=None, logger=None) -> dict:
     kind = job["kind"]
-    fmt = build_format(kind, job["quality"])
+    container = job.get("container") or "mp4"
+    fmt = build_format(kind, job["quality"], container)
 
     if job.get("parent_id"):
         outtmpl = os.path.join(
@@ -287,7 +301,17 @@ def build_ydl_opts(job: dict, progress_hook=None, logger=None) -> dict:
         opts.update(build_subtitle_opts(subs))
         if job.get("embed_subs") and kind != "audio":
             opts["postprocessors"].append({"key": "FFmpegEmbedSubtitle"})
-            opts["merge_output_format"] = "mkv"
+            # webm+subs falls back to mkv rather than webm: ffmpeg's subtitle
+            # embedder is unreliable targeting a raw .webm container, and mkv
+            # holds VP9/Opus (webm's own codecs) natively, so nothing is lost.
+            opts["merge_output_format"] = container if container in ("mp4", "mkv") else "mkv"
+
+    # Applies even without subs: a merge (bv*+ba) otherwise lands on
+    # whatever extension the video-only stream happened to be, usually
+    # webm. container='webm' leaves this unset deliberately -- letting
+    # yt-dlp/ffmpeg pick naturally is the "explicitly asked for webm" case.
+    if kind != "audio" and "merge_output_format" not in opts and container in ("mp4", "mkv"):
+        opts["merge_output_format"] = container
 
     if kind == "audio" and AUDIO_FORMAT:
         opts["postprocessors"].append({
@@ -416,13 +440,14 @@ def expand_playlist(job: dict) -> None:
                 if not url:
                     continue
                 conn.execute(
-                    "INSERT INTO jobs (url, title, kind, quality, subs, embed_subs, parent_id, status) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')",
+                    "INSERT INTO jobs (url, title, kind, quality, container, subs, embed_subs, parent_id, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued')",
                     (
                         url,
                         entry.get("title"),
                         job.get("child_kind") or "video",
                         job["quality"],
+                        job.get("container") or "mp4",
                         job["subs"],
                         job["embed_subs"],
                         job_id,

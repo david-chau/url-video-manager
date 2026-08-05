@@ -78,6 +78,7 @@ class AddJobRequest(BaseModel):
     url: str
     kind: str = "video"
     quality: str = "best"
+    container: str = "mp4"           # mp4 | mkv | webm -- ignored for kind='audio'
     subs: str | None = None
     embed_subs: bool = True
     strip_vocals: bool = False       # Phase 5 -- no-op unless kind='audio'
@@ -90,6 +91,7 @@ class BulkJobRequest(BaseModel):
     text: str
     kind: str = "video"
     quality: str = "best"
+    container: str = "mp4"
     subs: str | None = None
     embed_subs: bool = True
     strip_vocals: bool = False
@@ -114,6 +116,7 @@ def _create_job(
     url: str, kind: str, quality: str, subs: str | None, embed_subs: bool,
     strip_vocals: bool = False, merge_subs: bool = False,
     sub_primary: str | None = None, sub_secondary: str | None = None,
+    container: str = "mp4",
 ) -> dict:
     """Playlist classification is explicit, done at insert time -- not
     guessed at download time. Phase 1's noplaylist=True stays on every
@@ -122,12 +125,16 @@ def _create_job(
 
     strip_vocals is a no-op on anything but kind='audio' -- clamp it here
     rather than trust the client, same reasoning as kind being the only
-    source of truth for audio-vs-video."""
+    source of truth for audio-vs-video. container gets the same treatment:
+    an unrecognized value falls back to mp4 rather than reaching yt-dlp."""
     cls = worker.classify_url(url)
     strip_vocals = bool(strip_vocals) and kind == "audio"
+    if container not in worker.CONTAINER_CHOICES:
+        container = "mp4"
     common = dict(
         subs=subs, embed_subs=int(embed_subs), strip_vocals=int(strip_vocals),
         merge_subs=int(bool(merge_subs)), sub_primary=sub_primary, sub_secondary=sub_secondary,
+        container=container,
     )
     if cls == "playlist":
         job_id = db.insert_job(
@@ -156,7 +163,7 @@ async def api_add_job(req: AddJobRequest):
         raise HTTPException(400, "url required")
     return await asyncio.to_thread(
         _create_job, req.url.strip(), req.kind, req.quality, req.subs, req.embed_subs,
-        req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary,
+        req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
     )
 
 
@@ -168,7 +175,7 @@ async def api_bulk_add(req: BulkJobRequest):
     for url in new_urls:
         job = await asyncio.to_thread(
             _create_job, url, req.kind, req.quality, req.subs, req.embed_subs,
-            req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary,
+            req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
         )
         added.append(job)
     return {"added": added, "duplicates": dupes}

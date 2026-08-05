@@ -12,16 +12,6 @@
     color: #222;
     background: #fafafa;
   }
-  @media (prefers-color-scheme: dark) {
-    body { color: #ddd; background: #1a1a1a; }
-    input, select, textarea, button { background: #2a2a2a; color: #ddd; border-color: #444 !important; }
-    table { border-color: #333 !important; }
-    th, td { border-color: #333 !important; }
-    .panel { background: #222 !important; border-color: #333 !important; }
-    .bar { background: #333 !important; }
-    .modal-box { background: #222 !important; }
-    .modal-body { background: #1a1a1a !important; border-color: #333 !important; color: #ddd; }
-  }
   h1 { font-size: 18px; margin: 0 0 4px; display: flex; justify-content: space-between; align-items: baseline; }
   #counts { font-size: 13px; font-weight: normal; color: #888; }
   .panel { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
@@ -55,6 +45,24 @@
   #probeResults tr:hover { background: #f0f4ff; }
   footer { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
   .hint { color: #888; font-size: 12px; }
+
+  /* Must come after every rule above -- same-specificity CSS resolves by
+     source order, not by which media query looks more "specific". Dark
+     overrides declared before the base table/button rules lost the
+     cascade to them regardless of prefers-color-scheme, which is why the
+     table/buttons stayed white in dark mode. */
+  @media (prefers-color-scheme: dark) {
+    body { color: #ddd; background: #1a1a1a; }
+    input, select, textarea, button { background: #2a2a2a; color: #ddd; border-color: #444; }
+    button:hover { background: #383838; }
+    table { background: #1a1a1a; border-color: #333; }
+    th, td { border-color: #333; }
+    #probeResults tr:hover { background: #2a3a5a; }
+    .panel { background: #222; border-color: #333; }
+    .bar { background: #333; }
+    .modal-box { background: #222; }
+    .modal-body { background: #1a1a1a; border-color: #333; color: #ddd; }
+  }
 </style>
 
 <h1>URL Video Manager <span id="counts"></span></h1>
@@ -123,6 +131,13 @@
       <option value="video" selected>video</option>
       <option value="audio">audio only</option>
     </select>
+    <label title="Source streams are preferred mp4/m4a first either way -- webm is only picked when nothing else exists at the requested quality. Choosing webm here skips that preference and takes the best stream outright.">
+      format: <select id="container">
+        <option value="mp4" selected>mp4</option>
+        <option value="mkv">mkv</option>
+        <option value="webm">webm</option>
+      </select>
+    </label>
     <label>subs: <input type="text" id="subs" placeholder="en,pt" size="10"></label>
     <label><input type="checkbox" id="embedSubs" checked> embed</label>
     <label id="stripVocalsLabel"><input type="checkbox" id="stripVocals" disabled> strip vocals</label>
@@ -402,13 +417,15 @@ function subLangs() {
   return $('#subs').value.split(',').map(s => s.trim()).filter(Boolean);
 }
 
-// strip vocals only makes sense for audio jobs; merge bilingual needs at
-// least two requested subtitle languages to pick a top/bottom from.
+// strip vocals only makes sense for audio jobs; container (mp4/mkv/webm)
+// only makes sense for video ones; merge bilingual needs at least two
+// requested subtitle languages to pick a top/bottom from.
 function updateFormState() {
   const isAudio = $('#kind').value === 'audio';
   const stripEl = $('#stripVocals');
   stripEl.disabled = !isAudio;
   if (!isAudio) stripEl.checked = false;
+  $('#container').disabled = isAudio;
 
   const langs = subLangs();
   const canMerge = langs.length >= 2;
@@ -432,6 +449,7 @@ function formValues() {
   return {
     kind: $('#kind').value,
     quality: $('#quality').value,
+    container: $('#container').value,
     subs: $('#subs').value.trim() || null,
     embed_subs: $('#embedSubs').checked,
     strip_vocals: $('#stripVocals').checked,
@@ -495,7 +513,7 @@ $('#probeResults').addEventListener('click', async (e) => {
   try {
     await api('/api/jobs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: probeUrl, kind: $('#kind').value, quality: `fmt:${tr.dataset.fmt}`, subs: $('#subs').value.trim() || null, embed_subs: $('#embedSubs').checked }),
+      body: JSON.stringify({ url: probeUrl, kind: $('#kind').value, quality: `fmt:${tr.dataset.fmt}`, container: $('#container').value, subs: $('#subs').value.trim() || null, embed_subs: $('#embedSubs').checked }),
     });
     $('#probeResults').style.display = 'none';
     $('#urls').value = '';

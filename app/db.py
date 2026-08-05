@@ -45,14 +45,21 @@ CREATE INDEX IF NOT EXISTS idx_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_parent ON jobs(parent_id);
 """
 
+# Video source streams are almost always VP9/AV1-in-webm on modern
+# YouTube; without a container preference the merge naturally lands there
+# regardless of what the output was supposed to be. mp4 default; mkv or
+# webm selectable per job. Meaningless for kind='audio', left at its
+# default there.
+_ADD_CONTAINER = "ALTER TABLE jobs ADD COLUMN container TEXT NOT NULL DEFAULT 'mp4';"
+
 # Append-only: each entry is applied once, in order, tracked via
 # PRAGMA user_version. Future phases append here, never edit past entries.
-MIGRATIONS = [SCHEMA]
+MIGRATIONS = [SCHEMA, _ADD_CONTAINER]
 
 # Columns writers are allowed to touch via update_job(); keeps callers from
 # typo-ing a column name into a silent no-op.
 _JOB_COLUMNS = {
-    "url", "title", "kind", "quality", "subs", "embed_subs", "strip_vocals",
+    "url", "title", "kind", "quality", "container", "subs", "embed_subs", "strip_vocals",
     "merge_subs", "sub_primary", "sub_secondary", "parent_id", "child_kind",
     "status", "progress", "stage", "stage_i", "stage_n", "speed", "eta",
     "filepath", "error", "log",
