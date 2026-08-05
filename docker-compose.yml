@@ -1,11 +1,10 @@
-# Image is built + pushed from the Mac (linux/amd64, for the NAS's Celeron):
-#   docker buildx build --platform linux/amd64 --build-arg WITH_DEMUCS=false \
-#     -t ghcr.io/david-chau/url-video-manager:latest --push .
-# NAS side is pull-only:
+# .github/workflows/publish.yml builds + pushes :latest (linux/amd64, for
+# the NAS's Celeron) on every push to main. NAS side is pull-only:
 #   docker compose pull && docker compose up -d
 # Vocal separation (Phase 5) needs a WITH_DEMUCS=true build (~2GB torch) --
-# check the plan's Synology section first, non-AVX CPUs can't run torch at
-# all. Tag that build :demucs rather than overwriting :latest.
+# check the plan's Synology section first, non-AVX CPUs may not run torch at
+# all. That variant is manual-only: Actions tab -> Publish image -> Run
+# workflow -> with_demucs, tagged :demucs rather than overwriting :latest.
 services:
   app:
     image: ghcr.io/david-chau/url-video-manager:latest
