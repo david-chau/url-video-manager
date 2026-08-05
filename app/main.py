@@ -294,7 +294,7 @@ async def api_upload_subtitle(
         with open(dest, "w", encoding="utf-8") as f:
             f.write(text)
 
-        logger = worker.JobLogger()
+        logger = worker.JobLogger(job_id)
         merged_srt = None
         if job.get("merge_subs") and job.get("sub_primary") and job.get("sub_secondary"):
             merged_srt = worker.merge_bilingual_subs(

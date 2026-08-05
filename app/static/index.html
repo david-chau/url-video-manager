@@ -19,6 +19,8 @@
     th, td { border-color: #333 !important; }
     .panel { background: #222 !important; border-color: #333 !important; }
     .bar { background: #333 !important; }
+    .modal-box { background: #222 !important; }
+    .modal-body { background: #1a1a1a !important; border-color: #333 !important; color: #ddd; }
   }
   h1 { font-size: 18px; margin: 0 0 4px; display: flex; justify-content: space-between; align-items: baseline; }
   #counts { font-size: 13px; font-weight: normal; color: #888; }
@@ -138,6 +140,17 @@
 
 <input type="file" id="subFileInput" accept=".srt" style="display:none">
 
+<div id="logModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10">
+  <div class="modal-box" style="background:#fff; max-width:720px; margin:5vh auto; padding:16px; border-radius:8px; max-height:85vh; display:flex; flex-direction:column">
+    <div class="controls" style="margin-top:0">
+      <strong id="logModalTitle" style="font-size:14px"></strong>
+      <span class="spacer"></span>
+      <button id="logModalClose" type="button">Close</button>
+    </div>
+    <pre id="logModalBody" class="modal-body" style="overflow:auto; font-size:12px; background:#f5f5f5; border:1px solid #ddd; border-radius:4px; padding:8px; white-space:pre-wrap; word-break:break-word; margin-top:8px"></pre>
+  </div>
+</div>
+
 <table id="jobsTable">
   <thead>
     <tr>
@@ -232,7 +245,7 @@ function progressCell(j) {
     return `<span class="meta">&#10003; ${bytesHuman(j.filesize) || 'done'}</span>`;
   }
   if (j.status === 'error') {
-    return `<span class="meta" title="${escapeHtml(j.error || '')}">${escapeHtml((j.error || '').slice(0, 40))}</span>`;
+    return `<span class="meta">${escapeHtml((j.error || '').slice(0, 40))}</span>`;
   }
   if (j.status === 'canceled') return '<span class="meta">canceled</span>';
   if (j.status === 'queued') return '<span class="meta">&ndash;</span>';
@@ -265,6 +278,13 @@ function actionsCell(j) {
   // output to mux into.
   if (j.kind !== 'playlist' && j.status === 'done') {
     btns.push(`<button data-act="upload-sub" data-id="${j.id}">Upload subs&hellip;</button>`);
+  }
+  // Full log/error text -- the progress cell only ever showed a 40-char
+  // truncated error with no way to see the rest. This reads job.log/error
+  // straight from the in-memory row (already fetched by loadJobs()), no
+  // extra request.
+  if (['done', 'error', 'canceled'].includes(j.status) && (j.log || j.error)) {
+    btns.push(`<button data-act="log" data-id="${j.id}">Log</button>`);
   }
   return `<span class="row-actions">${btns.join('')}</span>`;
 }
@@ -321,6 +341,16 @@ jobsBody.addEventListener('click', async (e) => {
       $('#subFileInput').click();
       return; // upload itself happens in the file input's change handler
     }
+    if (act === 'log') {
+      const j = jobsById.get(Number(id));
+      $('#logModalTitle').textContent = j?.title || j?.url || `job ${id}`;
+      const parts = [];
+      if (j?.error) parts.push(`ERROR: ${j.error}`);
+      if (j?.log) parts.push(j.log);
+      $('#logModalBody').textContent = parts.join('\n\n') || '(no log)';
+      $('#logModal').style.display = 'block';
+      return;
+    }
   } catch (err) { alert(err.message); }
   loadJobs();
 });
@@ -347,6 +377,9 @@ $('#subFileInput').addEventListener('change', async (e) => {
 $('#selectAll').addEventListener('change', (e) => {
   document.querySelectorAll('.rowcheck').forEach(cb => cb.checked = e.target.checked);
 });
+
+$('#logModalClose').addEventListener('click', () => { $('#logModal').style.display = 'none'; });
+$('#logModal').addEventListener('click', (e) => { if (e.target.id === 'logModal') $('#logModal').style.display = 'none'; });
 
 $('#deleteSelected').addEventListener('click', async () => {
   const ids = [...document.querySelectorAll('.rowcheck:checked')].map(cb => Number(cb.dataset.id));

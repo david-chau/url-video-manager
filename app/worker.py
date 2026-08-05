@@ -158,11 +158,19 @@ def stage_n_guess(fmt: str) -> int:
 
 
 class JobLogger:
-    """Ring-buffered per-job log (~8KB) passed to yt-dlp as `logger`."""
+    """Ring-buffered per-job log (~8KB) passed to yt-dlp as `logger`, plus
+    warnings/errors also go to the container's own stdout (`docker logs`)
+    as they happen -- the DB copy is only visible through the UI's log
+    viewer, and `docker logs` is often the first thing reached for on a
+    NAS when something's failing."""
 
-    def __init__(self, cap: int = 8192):
+    def __init__(self, job_id: int | None = None, cap: int = 8192):
+        self.job_id = job_id
         self.cap = cap
         self.lines: list[str] = []
+
+    def _prefix(self) -> str:
+        return f"[job {self.job_id}] " if self.job_id is not None else ""
 
     def debug(self, msg):
         self.lines.append(msg)
@@ -172,9 +180,11 @@ class JobLogger:
 
     def warning(self, msg):
         self.lines.append(f"WARNING: {msg}")
+        print(f"{self._prefix()}WARNING: {msg}", flush=True)
 
     def error(self, msg):
         self.lines.append(f"ERROR: {msg}")
+        print(f"{self._prefix()}ERROR: {msg}", flush=True)
 
     def dump(self) -> str:
         text = "\n".join(self.lines)
@@ -333,7 +343,7 @@ def run_download(job: dict) -> dict:
     """Blocking. Runs under asyncio.to_thread. Returns the DB fields to
     write back for this job."""
     job_id = job["id"]
-    logger = JobLogger()
+    logger = JobLogger(job_id)
     hook = make_progress_hook(job_id, stage_n_guess(build_format(job["kind"], job["quality"])))
     opts = build_ydl_opts(job, progress_hook=hook, logger=logger)
 
@@ -362,6 +372,10 @@ def run_download(job: dict) -> dict:
     except DownloadCancelled:
         return {"status": "canceled", "error": "canceled by user", "log": logger.dump()}
     except Exception as e:  # yt-dlp raises a lot of different types
+        # yt-dlp's own logger callback already prints WARNING/ERROR lines as
+        # they happen; this covers exceptions that never went through it
+        # (e.g. raised before the logger was wired up, or by a postprocessor).
+        print(f"[job {job_id}] ERROR: {type(e).__name__}: {e}", flush=True)
         return {"status": "error", "error": f"{type(e).__name__}: {e}", "log": logger.dump()}
     finally:
         _job_thread.pop(job_id, None)
@@ -374,7 +388,7 @@ def expand_playlist(job: dict) -> None:
     transaction, then mark the parent done. Off the request thread --
     hundreds of entries would otherwise stall it."""
     job_id = job["id"]
-    logger = JobLogger()
+    logger = JobLogger(job_id)
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -416,6 +430,7 @@ def expand_playlist(job: dict) -> None:
                 )
         db.update_job(job_id, status="done", title=info.get("title") or job["url"], progress=100.0, log=logger.dump())
     except Exception as e:
+        print(f"[job {job_id}] ERROR: {type(e).__name__}: {e}", flush=True)
         db.update_job(job_id, status="error", error=f"{type(e).__name__}: {e}", log=logger.dump())
 
 
@@ -506,10 +521,9 @@ def run_separation(job: dict) -> dict:
     src = job["filepath"]
 
     if shutil.which("demucs") is None:
-        return {
-            "status": "error",
-            "error": "vocal separation not enabled -- rebuild with WITH_DEMUCS=true",
-        }
+        msg = "vocal separation not enabled -- rebuild with WITH_DEMUCS=true"
+        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        return {"status": "error", "error": msg}
 
     _job_thread[job_id] = threading.get_ident()
     tmpdir = tempfile.mkdtemp(prefix=f"demucs-{job_id}-")
@@ -543,14 +557,18 @@ def run_separation(job: dict) -> dict:
         if job_id in CANCELED:
             return {"status": "canceled", "error": "canceled by user"}
         if ret != 0:
-            return {"status": "error", "error": f"demucs exited with status {ret}"}
+            msg = f"demucs exited with status {ret}"
+            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            return {"status": "error", "error": msg}
 
         # Demucs writes nested at {tmpdir}/{model}/{track_stem}/no_vocals.wav,
         # not flat in tmpdir.
         stem = os.path.splitext(os.path.basename(src))[0]
         novocals_wav = os.path.join(tmpdir, DEMUCS_MODEL, stem, "no_vocals.wav")
         if not os.path.exists(novocals_wav):
-            return {"status": "error", "error": f"demucs output not found: {novocals_wav}"}
+            msg = f"demucs output not found: {novocals_wav}"
+            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            return {"status": "error", "error": msg}
 
         ext = AUDIO_FORMAT or os.path.splitext(src)[1].lstrip(".") or "m4a"
         out_path = os.path.join(os.path.dirname(src), f"{stem}_novocals.{ext}")
@@ -564,6 +582,7 @@ def run_separation(job: dict) -> dict:
 
         return {"status": "done", "progress": 100.0, "filepath": out_path}
     except subprocess.CalledProcessError as e:
+        print(f"[job {job_id}] ERROR: ffmpeg encode failed: {e}", flush=True)
         return {"status": "error", "error": f"ffmpeg encode failed: {e}"}
     finally:
         _job_thread.pop(job_id, None)
@@ -843,7 +862,7 @@ async def _run_subs_and_mux_stage(job: dict, orig_filepath: str, current_filepat
     orig_base = os.path.splitext(orig_filepath)[0]
     merged_srt = None
     if job.get("subs") and job.get("merge_subs"):
-        logger = JobLogger()
+        logger = JobLogger(job_id)
         merged_srt = await asyncio.to_thread(merge_bilingual_subs, job, orig_base, info, logger)
         if logger.lines:
             prior = job.get("log") or ""
@@ -896,6 +915,7 @@ async def _dispatch(job: dict) -> None:
         else:
             await _process_job(job)
     except Exception as e:  # never let one bad job kill the loop
+        print(f"[job {job['id']}] ERROR: {type(e).__name__}: {e}", flush=True)
         db.update_job(job["id"], status="error", error=f"{type(e).__name__}: {e}")
 
 
@@ -923,6 +943,7 @@ async def _continue_after_download(job: dict, info: dict | None) -> None:
                 return  # error/canceled already written by _run_separation_stage
         await _run_subs_and_mux_stage(job, orig_filepath, current_filepath, info)
     except Exception as e:
+        print(f"[job {job_id}] ERROR: {type(e).__name__}: {e}", flush=True)
         db.update_job(job_id, status="error", error=f"{type(e).__name__}: {e}")
 
 
