@@ -11,7 +11,7 @@ services:
     ports:
       # All interfaces, not 127.0.0.1: a loopback bind on a headless NAS is
       # only reachable from the NAS itself.
-      - "8080:8080"
+      - "1234:8080"
     volumes:
       - ./downloads:/downloads
       - ./data:/data
