@@ -52,7 +52,28 @@ OCR_CROP_BOTTOM_PCT = float(os.environ.get("OCR_CROP_BOTTOM_PCT", "0.22"))
 # Tesseract's '+'-joined multi-language syntax. Used when the job has no
 # gen_subs_lang hint, or the hint doesn't match one of the small set of
 # mappings in ocr_lang_for() below.
-OCR_LANG = os.environ.get("OCR_LANG", "chi_sim+eng")
+#
+# chi_sim+eng (a single CJK script paired with eng) is a confirmed-bad
+# combination, not a hypothetical one: Tesseract's language model gets
+# confused by a lone CJK script mixed with Latin and produces pure noise --
+# e.g. an actual on-screen "九阳神拳吧" OCR'd as "FLBA SIE" with chi_sim+eng,
+# but correctly as "九陽神拳吧" with chi_sim+chi_tra(+eng). Two CJK scripts
+# together anchor it; eng can safely ride along once both are present.
+# Verified directly against a rendered test image, not assumed.
+OCR_LANG = os.environ.get("OCR_LANG", "chi_sim+chi_tra+eng")
+
+# Phase 8: subtitle translation (argos-translate) runs inline in the
+# 'transcribing' stage -- no own semaphore, it's cheap text-only work
+# compared to Whisper/OCR/demucs, riding under TRANSCRIBE_SEM instead.
+# argos-translate downloads a language-pair model (tens to a few hundred MB)
+# on first use of that pair; ARGOS_PACKAGES_DIR points that download at
+# /data (this app's one persistent volume, see YTDLP_COOKIES above) so it's
+# fetched once across container restarts, not baked into every image build.
+# Must be set before argostranslate.settings is first imported (done lazily,
+# inside get_argos_translator below, same gating as faster_whisper) --
+# setting it here at module import time is early enough.
+TRANSLATE_MODEL_DIR = os.environ.get("TRANSLATE_MODEL_DIR", "/data/argos-models")
+os.environ.setdefault("ARGOS_PACKAGES_DIR", TRANSLATE_MODEL_DIR)
 
 # Job ids the user has asked to cancel. Checked on every progress_hook fire.
 CANCELED: set[int] = set()
@@ -846,6 +867,33 @@ def resolve_orig_base(job: dict) -> str:
     return stem
 
 
+def list_job_files(job: dict) -> list[str]:
+    """Every file on disk sharing this job's pre-pipeline filename stem: the
+    current output (original download, post-separation '_novocals', or
+    post-mux -- whichever stage last touched it) plus every sidecar .srt
+    (downloaded, bilingual-merged, Whisper/OCR-generated, translated, or
+    uploaded via 6c) -- they're all named against the same
+    resolve_orig_base() stem no matter which pipeline stages ran, since
+    every srt-writing stage receives that same pre-pipeline base. Used by
+    the UI's per-job file list so every artifact is individually
+    downloadable, not just the main muxed output via 'Open'.
+
+    Deliberately a plain string-prefix match, not requiring a '.' boundary
+    the way find_subtitle_files/find_audio_source do -- that's needed here
+    specifically to also catch demucs's '_novocals' suffix, which has no
+    dot before it."""
+    if not job.get("filepath"):
+        return []
+    base = resolve_orig_base(job)
+    d = os.path.dirname(base) or "."
+    prefix = os.path.basename(base)
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return []
+    return [os.path.join(d, n) for n in sorted(names) if n.startswith(prefix)]
+
+
 def find_audio_source(job: dict) -> str | None:
     """Locates the pre-mux audio file next to an already-muxed .mkv (Phase
     6c re-upload path) -- our mux step always writes a *new* .mkv and never
@@ -888,7 +936,9 @@ def decode_srt_bytes(raw: bytes) -> str:
 # only needs to get from "job + a source file" to "(path, iso-lang, title)
 # tuples", the muxing itself is unchanged.
 
-_OCR_LANG_HINTS = {"zh": "chi_sim+eng", "en": "eng"}
+# chi_sim+chi_tra+eng, not chi_sim+eng -- see the OCR_LANG comment above,
+# a lone CJK script combined with eng is confirmed to produce garbage.
+_OCR_LANG_HINTS = {"zh": "chi_sim+chi_tra+eng", "en": "eng"}
 
 
 def ocr_lang_for(gen_subs_lang: str | None) -> str:
@@ -1095,17 +1145,131 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# --------------------------------------------------------- translate (P8)
+#
+# Translates an already-generated (Whisper/OCR) .srt into a second,
+# additional soft-sub track via offline argos-translate -- no cloud API, no
+# API key, an explicit user choice to keep this app self-hosted. Runs
+# inline in run_transcribe below, after whichever engine(s) produced the
+# original-language track(s): the original track is always kept, the
+# translation is one more (path, iso-lang, title) tuple fed to the same
+# collect_sub_tracks/run_mux machinery.
+
+def get_argos_translator(source_lang: str, target_lang: str):
+    """Ensures the source->target argos-translate package is installed
+    (downloading it into TRANSLATE_MODEL_DIR on first use -- see the
+    ARGOS_PACKAGES_DIR module comment above) and returns a plain str->str
+    callable for that language pair. Raises RuntimeError with a clear,
+    specific message -- never an opaque traceback -- if argostranslate
+    isn't installed (WITH_TRANSLATE=false build) or the pair doesn't exist
+    in argos's package index at all."""
+    try:
+        import argostranslate.package
+        import argostranslate.translate
+    except ImportError:
+        raise RuntimeError("translation not enabled -- rebuild with WITH_TRANSLATE=true")
+
+    from_code = (source_lang or "").split("-")[0].lower()
+    to_code = (target_lang or "").split("-")[0].lower()
+
+    installed = argostranslate.package.get_installed_packages()
+    have = any(p.from_code == from_code and p.to_code == to_code for p in installed)
+    if not have:
+        argostranslate.package.update_package_index()
+        ok = argostranslate.package.install_package_for_language_pair(from_code, to_code)
+        if not ok:
+            raise RuntimeError(
+                f"no argos-translate package available for '{from_code}' -> '{to_code}'"
+            )
+
+    def _translate(text: str) -> str:
+        return argostranslate.translate.translate(text, from_code, to_code)
+
+    return _translate
+
+
+def _translate_cues_with(
+    cues: list[tuple[float, float, str]], translate_fn,
+) -> list[tuple[float, float, str]]:
+    """Pure mapping, unit-tested with a fake translate_fn -- no real
+    argos-translate model involved. One call per cue (not batched: subtitle
+    cue counts are small enough that per-cue call overhead doesn't matter,
+    and it keeps the 1:1 timing/count guarantee trivially true rather than
+    depending on a join/split round-trip through a batch translator)."""
+    return [(start, end, translate_fn(text)) for start, end, text in cues]
+
+
+def translate_cues(
+    cues: list[tuple[float, float, str]], source_lang: str, target_lang: str,
+) -> list[tuple[float, float, str]]:
+    """Resolves the argos-translate model for source_lang->target_lang (see
+    get_argos_translator) and translates every cue's text, keeping timings
+    and cue count exactly 1:1 with the input."""
+    translate_fn = get_argos_translator(source_lang, target_lang)
+    return _translate_cues_with(cues, translate_fn)
+
+
+def run_translate(job: dict, src_srt: str, source_lang: str, target_lang: str, out_srt: str) -> dict:
+    """Blocking. Reads src_srt (an already-generated whisper/ocr track) back
+    with pysrt, translates every cue via translate_cues, and writes out_srt
+    with the same timings via write_srt (the same helper the whisper/ocr
+    pipelines use, so timestamp formatting isn't written a third time)."""
+    job_id = job["id"]
+    try:
+        subs = pysrt.open(src_srt)
+        cues = [(item.start.ordinal / 1000.0, item.end.ordinal / 1000.0, item.text) for item in subs]
+        translated = translate_cues(cues, source_lang, target_lang)
+        write_srt(translated, out_srt)
+        return {"status": "done", "path": out_srt}
+    except RuntimeError as e:
+        # get_argos_translator's own clear-message failures (not enabled /
+        # language pair not available) -- pass the message straight through.
+        print(f"[job {job_id}] ERROR: {e}", flush=True)
+        return {"status": "error", "error": str(e)}
+    except Exception as e:
+        msg = f"translation failed: {type(e).__name__}: {e}"
+        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        return {"status": "error", "error": msg}
+
+
+def _add_translated_track(
+    job: dict, orig_base: str, src_srt: str, engine: str,
+    source_lang: str, target_lang: str, tracks: list[tuple[str, str, str]],
+) -> dict | None:
+    """Runs run_translate for one already-generated track and appends
+    (path, iso-lang, title) to tracks in place on success. Returns an error/
+    canceled result dict on failure (already logged by run_translate), or
+    None on success -- mirrors run_transcribe's own early-return-on-failure
+    shape so callers can `if err: return err` the same way they already do
+    for run_whisper_transcribe/run_ocr_transcribe."""
+    out_srt = f"{orig_base}.{engine}.{target_lang}.srt"
+    result = run_translate(job, src_srt, source_lang, target_lang, out_srt)
+    if result["status"] != "done":
+        return result
+    tracks.append((out_srt, iso639_2(target_lang), f"{engine} -> {target_lang}"))
+    return None
+
+
 def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
     """Blocking. Runs whichever of whisper/ocr job['gen_subs'] asks for
     ('whisper'|'ocr'|'both') and returns the (path, iso-lang, title) tuples
     to hand to collect_sub_tracks/run_mux alongside downloaded/merged
     tracks. Sets _job_thread so the ffmpeg/tesseract subprocesses spawned
-    below are cancelable the same way run_separation's demucs call is."""
+    below are cancelable the same way run_separation's demucs call is.
+
+    Phase 8: if job['translate_to'] is set (main.py's _create_job already
+    clamps it to None when gen_subs_lang isn't -- argos-translate can't
+    guess the source language), each generated track above is additionally
+    translated and appended as one more track, original kept alongside it.
+    Checked between tracks (job_id in CANCELED), not mid-translation --
+    translating a short subtitle file's text is fast, unlike the Whisper
+    segment loop's need for finer-grained cancellation."""
     job_id = job["id"]
     _job_thread[job_id] = threading.get_ident()
     lang_hint = job.get("gen_subs_lang")
     iso = iso639_2(lang_hint) if lang_hint else "und"
     want = job.get("gen_subs") or "off"
+    target_lang = (job.get("translate_to") or "").strip() or None
     tracks: list[tuple[str, str, str]] = []
     try:
         if want in ("whisper", "both"):
@@ -1114,6 +1278,12 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
             if result["status"] != "done":
                 return result
             tracks.append((out_srt, iso, "whisper" if lang_hint else "whisper (auto)"))
+            if target_lang and lang_hint:
+                if job_id in CANCELED:
+                    return {"status": "canceled", "error": "canceled by user"}
+                err = _add_translated_track(job, orig_base, out_srt, "whisper", lang_hint, target_lang, tracks)
+                if err is not None:
+                    return err
 
         # kind='audio' has no frames -- main.py already clamps ocr/both down
         # to whisper at job-creation time, so this only guards a stale row
@@ -1124,6 +1294,12 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
             if result["status"] != "done":
                 return result
             tracks.append((out_srt, iso, "ocr" if lang_hint else "ocr (auto)"))
+            if target_lang and lang_hint:
+                if job_id in CANCELED:
+                    return {"status": "canceled", "error": "canceled by user"}
+                err = _add_translated_track(job, orig_base, out_srt, "ocr", lang_hint, target_lang, tracks)
+                if err is not None:
+                    return err
 
         if not tracks:
             return {"status": "error", "error": "no subtitle tracks generated"}

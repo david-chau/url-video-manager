@@ -10,13 +10,17 @@
 # manual-only :transcribe tag, same non-AVX caveat as demucs (see the
 # Dockerfile's WITH_TRANSCRIBE comment). OCR (tesseract) needs no build
 # flag at all -- it's in every image.
+# Subtitle translation (Phase 8, translate_to) needs a WITH_TRANSLATE=true
+# build (argos-translate/ctranslate2, same size/risk as WITH_TRANSCRIBE) --
+# same manual-only :translate tag. Language-pair models download into
+# TRANSLATE_MODEL_DIR (under /data) on first use, not baked into the image.
 services:
   app:
     image: ghcr.io/david-chau/url-video-manager:latest
     ports:
       # All interfaces, not 127.0.0.1: a loopback bind on a headless NAS is
       # only reachable from the NAS itself.
-      - "1234:8080"
+      - "1208:8080"
     volumes:
       - ./downloads:/downloads
       - ./data:/data
@@ -30,7 +34,8 @@ services:
       WHISPER_MODEL: "small"    # 'base' is the faster/lower-quality fallback if 'small' is too slow on the Celeron
       OCR_SAMPLE_FPS: "2"       # frames/sec sampled for hardsub OCR
       OCR_CROP_BOTTOM_PCT: "0.22"  # bottom fraction of the frame OCR'd (where hardsubs almost always sit)
-      OCR_LANG: "chi_sim+eng"  # tesseract '+'-joined lang packs, used when a job has no gen_subs_lang hint
+      OCR_LANG: "chi_sim+chi_tra+eng"  # tesseract '+'-joined lang packs, used when a job has no gen_subs_lang hint -- chi_sim+eng alone (no chi_tra) is confirmed to garble CJK text, see worker.py's OCR_LANG comment
+      TRANSLATE_MODEL_DIR: "/data/argos-models"  # argos-translate language-pair models, downloaded on first use
       YTDLP_COOKIES: "/data/cookies.txt"
       APP_PASSWORD: ""          # unset by default; set to require HTTP Basic auth on every route
     # On Synology, uncomment and set to your `id <you>` uid:gid (usually the

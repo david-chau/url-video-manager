@@ -150,6 +150,7 @@
       </select>
     </label>
     <label>lang hint: <input type="text" id="genSubsLang" placeholder="zh" size="4"></label>
+    <label title="Translate the generated track into a second language via offline argos-translate. Needs a lang hint above (argos-translate can't detect the source language on its own) -- both tracks are kept, embedded side by side.">translate to: <input type="text" id="translateTo" placeholder="en" size="4" disabled></label>
     <span class="spacer"></span>
     <button id="probeBtn">Probe formats&hellip;</button>
     <button id="addBtn" class="primary">Add</button>
@@ -172,6 +173,17 @@
       <button id="logModalClose" type="button">Close</button>
     </div>
     <pre id="logModalBody" class="modal-body" style="overflow:auto; font-size:12px; background:#f5f5f5; border:1px solid #ddd; border-radius:4px; padding:8px; white-space:pre-wrap; word-break:break-word; margin-top:8px"></pre>
+  </div>
+</div>
+
+<div id="filesModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10">
+  <div class="modal-box" style="background:#fff; max-width:520px; margin:5vh auto; padding:16px; border-radius:8px; max-height:85vh; display:flex; flex-direction:column">
+    <div class="controls" style="margin-top:0">
+      <strong id="filesModalTitle" style="font-size:14px"></strong>
+      <span class="spacer"></span>
+      <button id="filesModalClose" type="button">Close</button>
+    </div>
+    <div id="filesModalBody" class="modal-body" style="overflow:auto; font-size:13px; background:#f5f5f5; border:1px solid #ddd; border-radius:4px; padding:8px; margin-top:8px"></div>
   </div>
 </div>
 
@@ -288,6 +300,10 @@ function actionsCell(j) {
   } else if (j.status === 'done') {
     const url = fileUrl(j.filepath);
     if (url) btns.push(`<a href="${url}" target="_blank"><button>Open</button></a>`);
+    // Lists every artifact (main file + every .srt sidecar) as individually
+    // downloadable -- 'Open' only ever surfaced the main muxed file, and
+    // subtitle sidecars had no download path in the UI at all before this.
+    btns.push(`<button data-act="files" data-id="${j.id}">Files&hellip;</button>`);
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
   } else if (['error', 'canceled'].includes(j.status)) {
     btns.push(`<button data-act="retry" data-id="${j.id}">Retry</button>`);
@@ -375,6 +391,22 @@ jobsBody.addEventListener('click', async (e) => {
       $('#logModal').style.display = 'block';
       return;
     }
+    if (act === 'files') {
+      const j = jobsById.get(Number(id));
+      $('#filesModalTitle').textContent = j?.title || j?.url || `job ${id}`;
+      const body = $('#filesModalBody');
+      body.textContent = 'Loading…';
+      $('#filesModal').style.display = 'block';
+      try {
+        const { files } = await api(`/api/jobs/${id}/files`);
+        body.innerHTML = files.length
+          ? files.map(f => `<div style="padding:3px 0"><a href="${f.url}" download>${escapeHtml(f.name)}</a></div>`).join('')
+          : '<span class="meta">No files found.</span>';
+      } catch (err) {
+        body.textContent = err.message;
+      }
+      return;
+    }
   } catch (err) { alert(err.message); }
   loadJobs();
 });
@@ -404,6 +436,8 @@ $('#selectAll').addEventListener('change', (e) => {
 
 $('#logModalClose').addEventListener('click', () => { $('#logModal').style.display = 'none'; });
 $('#logModal').addEventListener('click', (e) => { if (e.target.id === 'logModal') $('#logModal').style.display = 'none'; });
+$('#filesModalClose').addEventListener('click', () => { $('#filesModal').style.display = 'none'; });
+$('#filesModal').addEventListener('click', (e) => { if (e.target.id === 'filesModal') $('#filesModal').style.display = 'none'; });
 
 $('#deleteSelected').addEventListener('click', async () => {
   const ids = [...document.querySelectorAll('.rowcheck:checked')].map(cb => Number(cb.dataset.id));
@@ -447,6 +481,14 @@ function updateFormState() {
     genSubsEl.value = 'whisper';
   }
 
+  // translate needs both a generation engine running and a lang hint
+  // (argos-translate has no language detection of its own) -- mirrored
+  // server-side in main.py's _create_job.
+  const translateToEl = $('#translateTo');
+  const canTranslate = genSubsEl.value !== 'off' && $('#genSubsLang').value.trim() !== '';
+  translateToEl.disabled = !canTranslate;
+  if (!canTranslate) translateToEl.value = '';
+
   const langs = subLangs();
   const canMerge = langs.length >= 2;
   const mergeEl = $('#mergeSubs');
@@ -463,6 +505,8 @@ function updateFormState() {
 
 $('#kind').addEventListener('change', updateFormState);
 $('#subs').addEventListener('input', updateFormState);
+$('#genSubs').addEventListener('change', updateFormState);
+$('#genSubsLang').addEventListener('input', updateFormState);
 updateFormState();
 
 function formValues() {
@@ -478,6 +522,7 @@ function formValues() {
     sub_secondary: $('#mergeSubs').checked ? $('#subSecondary').value : null,
     gen_subs: $('#genSubs').value,
     gen_subs_lang: $('#genSubsLang').value.trim() || null,
+    translate_to: $('#translateTo').value.trim() || null,
   };
 }
 

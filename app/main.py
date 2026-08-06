@@ -101,6 +101,7 @@ class AddJobRequest(BaseModel):
     sub_secondary: str | None = None  # e.g. 'en' -- bottom line
     gen_subs: str = "off"            # Phase 7 -- off|whisper|ocr|both
     gen_subs_lang: str | None = None  # e.g. 'zh' -- hint for both engines
+    translate_to: str | None = None  # Phase 8 -- e.g. 'en'; needs gen_subs_lang set
 
 
 class BulkJobRequest(BaseModel):
@@ -116,6 +117,7 @@ class BulkJobRequest(BaseModel):
     sub_secondary: str | None = None
     gen_subs: str = "off"
     gen_subs_lang: str | None = None
+    translate_to: str | None = None
     force: bool = False
 
 
@@ -135,6 +137,7 @@ def _create_job(
     strip_vocals: bool = False, merge_subs: bool = False,
     sub_primary: str | None = None, sub_secondary: str | None = None,
     container: str = "mp4", gen_subs: str = "off", gen_subs_lang: str | None = None,
+    translate_to: str | None = None,
 ) -> dict:
     """Playlist classification is explicit, done at insert time -- not
     guessed at download time. Phase 1's noplaylist=True stays on every
@@ -146,7 +149,13 @@ def _create_job(
     source of truth for audio-vs-video. container gets the same treatment:
     an unrecognized value falls back to mp4 rather than reaching yt-dlp.
     gen_subs='ocr'/'both' needs video frames that don't exist for an
-    audio-only job -- clamped down to 'whisper' here the same way."""
+    audio-only job -- clamped down to 'whisper' here the same way.
+
+    translate_to (Phase 8) needs a known source language: argos-translate
+    has no language detection of its own, so it rides on gen_subs_lang as
+    that hint. No gen_subs_lang, or nothing being generated in the first
+    place (gen_subs='off'), just turns translation off rather than erroring
+    -- same clamp-not-reject style as strip_vocals/container above."""
     cls = worker.classify_url(url)
     strip_vocals = bool(strip_vocals) and kind == "audio"
     if container not in worker.CONTAINER_CHOICES:
@@ -155,10 +164,14 @@ def _create_job(
         gen_subs = "off"
     if kind == "audio" and gen_subs in ("ocr", "both"):
         gen_subs = "whisper"
+    translate_to = (translate_to or "").strip() or None
+    if gen_subs == "off" or not gen_subs_lang:
+        translate_to = None
     common = dict(
         subs=subs, embed_subs=int(embed_subs), strip_vocals=int(strip_vocals),
         merge_subs=int(bool(merge_subs)), sub_primary=sub_primary, sub_secondary=sub_secondary,
         container=container, gen_subs=gen_subs, gen_subs_lang=gen_subs_lang,
+        translate_to=translate_to,
     )
     if cls == "playlist":
         job_id = db.insert_job(
@@ -181,6 +194,23 @@ async def api_list_jobs():
     return await asyncio.to_thread(db.get_jobs)
 
 
+@app.get("/api/jobs/{job_id}/files")
+async def api_job_files(job_id: int):
+    """Every artifact on disk for this job -- the main output plus every
+    sidecar .srt -- individually linked. 'Open'/fileUrl() only ever
+    surfaced the main muxed file; subtitle sidecars had no UI path to them
+    at all before this."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    paths = await asyncio.to_thread(worker.list_job_files, job)
+    files = []
+    for p in paths:
+        rel = os.path.relpath(p, worker.DOWNLOADS_DIR)
+        files.append({"name": os.path.basename(p), "url": "/files/" + rel.replace(os.sep, "/")})
+    return {"files": files}
+
+
 @app.post("/api/jobs")
 async def api_add_job(req: AddJobRequest):
     if not req.url.strip():
@@ -188,7 +218,7 @@ async def api_add_job(req: AddJobRequest):
     return await asyncio.to_thread(
         _create_job, req.url.strip(), req.kind, req.quality, req.subs, req.embed_subs,
         req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
-        req.gen_subs, req.gen_subs_lang,
+        req.gen_subs, req.gen_subs_lang, req.translate_to,
     )
 
 
@@ -201,7 +231,7 @@ async def api_bulk_add(req: BulkJobRequest):
         job = await asyncio.to_thread(
             _create_job, url, req.kind, req.quality, req.subs, req.embed_subs,
             req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
-            req.gen_subs, req.gen_subs_lang,
+            req.gen_subs, req.gen_subs_lang, req.translate_to,
         )
         added.append(job)
     return {"added": added, "duplicates": dupes}

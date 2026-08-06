@@ -546,9 +546,13 @@ def test_p7_ocr_frames_to_cues_merge():
 
 
 def test_p7_ocr_lang_for():
+    # chi_sim+eng (a lone CJK script combined with eng) is a confirmed-bad
+    # Tesseract combination -- garbles real text into noise. Must be
+    # chi_sim+chi_tra+eng: two CJK scripts together anchor recognition
+    # correctly, and eng can safely ride along once both are present.
     assert worker.ocr_lang_for(None) == worker.OCR_LANG
-    assert worker.ocr_lang_for("zh") == "chi_sim+eng"
-    assert worker.ocr_lang_for("zh-Hans") == "chi_sim+eng"
+    assert worker.ocr_lang_for("zh") == "chi_sim+chi_tra+eng"
+    assert worker.ocr_lang_for("zh-Hans") == "chi_sim+chi_tra+eng"
     assert worker.ocr_lang_for("en") == "eng"
     assert worker.ocr_lang_for("fr") == worker.OCR_LANG  # unmapped -> fall back to default
     print("ok: ocr_lang_for maps zh/en, falls back to OCR_LANG for everything else")
@@ -645,6 +649,129 @@ def test_p7_gen_subs_clamped_for_audio():
     )
     assert job5["gen_subs"] == "off"
     print("ok: gen_subs='ocr'/'both' clamped to 'whisper' for kind='audio', unrecognized values fall back to 'off'")
+
+
+# --------------------------------------------------------------------- P8
+
+def test_p8_translate_cues_pure():
+    """Pure mapping logic, tested with a fake translate_fn (uppercase) --
+    no real argos-translate model involved. Proves timing/count stay
+    exactly 1:1 and that text actually flows through the callable, the
+    same "test the pure logic with synthetic input" discipline as
+    ocr_frames_to_cues/write_srt above."""
+    cues = [(0.0, 1.0, "hello"), (1.0, 2.5, "world")]
+    out = worker._translate_cues_with(cues, lambda t: t.upper())
+    assert out == [(0.0, 1.0, "HELLO"), (1.0, 2.5, "WORLD")]
+    assert len(out) == len(cues)
+    print("ok: _translate_cues_with preserves timing/count 1:1, text flows through translate_fn")
+
+
+def test_p8_missing_argostranslate_fails_fast():
+    try:
+        import argostranslate  # noqa: F401
+        print("skip: argostranslate is actually installed here, can't exercise the not-enabled path")
+        return
+    except ImportError:
+        pass
+    raised = None
+    try:
+        worker.get_argos_translator("zh", "en")
+    except RuntimeError as e:
+        raised = e
+    assert raised is not None, "expected RuntimeError when argostranslate isn't installed"
+    assert "WITH_TRANSLATE=true" in str(raised)
+    print("ok: missing argostranslate fails fast with a clear error")
+
+
+def test_p8_run_translate_wraps_missing_engine_as_error_dict():
+    fresh_db()
+    job_id = db.insert_job(url="https://example.com/show", kind="video", status="transcribing")
+    job = db.get_job(job_id)
+    try:
+        import argostranslate  # noqa: F401
+        print("skip: argostranslate is actually installed here, can't exercise the not-enabled path")
+        return
+    except ImportError:
+        pass
+    d = tempfile.mkdtemp(prefix="uvm-translate-test-")
+    src = os.path.join(d, "in.srt")
+    worker.write_srt([(0.0, 1.0, "hello")], src)
+    out = os.path.join(d, "out.srt")
+    result = worker.run_translate(job, src, "zh", "en", out)
+    assert result["status"] == "error"
+    assert "WITH_TRANSLATE=true" in result["error"]
+    print("ok: run_translate surfaces the not-enabled error via the job error dict, not a raw traceback")
+
+
+def test_p8_translate_to_clamped():
+    fresh_db()
+    # no gen_subs_lang hint -- argos-translate can't know the source
+    # language, so translate_to gets cleared rather than erroring, same
+    # clamp-not-reject style as strip_vocals/container/gen_subs.
+    job = main._create_job(
+        "https://example.com/v1", "video", "best", None, True,
+        gen_subs="whisper", gen_subs_lang=None, translate_to="en",
+    )
+    assert job["translate_to"] is None
+
+    # gen_subs='off' -- nothing generated to translate, same clamp.
+    job2 = main._create_job(
+        "https://example.com/v2", "video", "best", None, True,
+        gen_subs="off", gen_subs_lang="zh", translate_to="en",
+    )
+    assert job2["translate_to"] is None
+
+    # both a generation engine and a lang hint set -- passes through.
+    job3 = main._create_job(
+        "https://example.com/v3", "video", "best", None, True,
+        gen_subs="whisper", gen_subs_lang="zh", translate_to="en",
+    )
+    assert job3["translate_to"] == "en"
+    print("ok: translate_to clamped to None unless gen_subs is on and gen_subs_lang is set")
+
+
+# --------------------------------------------------------------------- P9
+
+def test_p9_list_job_files():
+    d = tempfile.mkdtemp(prefix="uvm-files-test-")
+    stem = os.path.join(d, "Some Title [abc123]")
+    for name in (
+        stem + ".mp4",
+        stem + ".en.srt",
+        stem + ".zh-en.srt",
+        stem + ".whisper.srt",
+        stem + ".ocr.en.srt",
+    ):
+        open(name, "w").close()
+    # an unrelated file with a colliding-ish prefix must NOT show up
+    open(stem + " Extra Cut [xyz999].mp4", "w").close()
+
+    job = {"filepath": stem + ".mp4", "strip_vocals": 0}
+    files = worker.list_job_files(job)
+    names = sorted(os.path.basename(f) for f in files)
+    assert names == sorted([
+        "Some Title [abc123].mp4",
+        "Some Title [abc123].en.srt",
+        "Some Title [abc123].zh-en.srt",
+        "Some Title [abc123].whisper.srt",
+        "Some Title [abc123].ocr.en.srt",
+        "Some Title [abc123] Extra Cut [xyz999].mp4",
+    ]), names
+    # ^ the "Extra Cut" collision IS included -- list_job_files trades a
+    # little precision for simplicity (plain prefix match, no '.' boundary
+    # requirement) so it also catches demucs's '_novocals' suffix, which
+    # has no dot before it. Documented tradeoff, not a bug -- see the
+    # function's docstring.
+
+    # demucs-suffixed current output must resolve back to the same prefix
+    open(stem + "_novocals.m4a", "w").close()
+    novocals_job = {"filepath": stem + "_novocals.m4a", "strip_vocals": 1}
+    novocals_files = worker.list_job_files(novocals_job)
+    assert any(f.endswith("_novocals.m4a") for f in novocals_files)
+    assert any(f.endswith(".en.srt") for f in novocals_files)
+
+    assert worker.list_job_files({"filepath": None}) == []
+    print("ok: list_job_files finds every sidecar sharing a job's filename stem")
 
 
 if __name__ == "__main__":

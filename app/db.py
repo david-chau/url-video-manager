@@ -62,15 +62,22 @@ _ADD_GEN_SUBS = (
     "ALTER TABLE jobs ADD COLUMN gen_subs_lang TEXT;"
 )
 
+# Phase 8: translate a generated (Whisper/OCR) track into a second,
+# additional soft-sub track via offline argos-translate. NULL/empty = off.
+# Needs gen_subs_lang set too (argos-translate has no language detection of
+# its own) -- clamped in main.py's _create_job the same way gen_subs='ocr'
+# is clamped for kind='audio'.
+_ADD_TRANSLATE = "ALTER TABLE jobs ADD COLUMN translate_to TEXT;"
+
 # Append-only: each entry is applied once, in order, tracked via
 # PRAGMA user_version. Future phases append here, never edit past entries.
-MIGRATIONS = [SCHEMA, _ADD_CONTAINER, _ADD_GEN_SUBS]
+MIGRATIONS = [SCHEMA, _ADD_CONTAINER, _ADD_GEN_SUBS, _ADD_TRANSLATE]
 
 # Columns writers are allowed to touch via update_job(); keeps callers from
 # typo-ing a column name into a silent no-op.
 _JOB_COLUMNS = {
     "url", "title", "kind", "quality", "container", "subs", "embed_subs", "strip_vocals",
-    "merge_subs", "sub_primary", "sub_secondary", "gen_subs", "gen_subs_lang",
+    "merge_subs", "sub_primary", "sub_secondary", "gen_subs", "gen_subs_lang", "translate_to",
     "parent_id", "child_kind",
     "status", "progress", "stage", "stage_i", "stage_n", "speed", "eta",
     "filepath", "error", "log",

@@ -13,6 +13,10 @@ on:
         description: "Also build/push the WITH_TRANSCRIBE=true (Whisper hardsub ASR) variant, tagged :transcribe."
         type: boolean
         default: false
+      with_translate:
+        description: "Also build/push the WITH_TRANSLATE=true (argos-translate offline subtitle translation) variant, tagged :translate."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -83,5 +87,20 @@ jobs:
           push: true
           build-args: WITH_TRANSCRIBE=true
           tags: ghcr.io/${{ github.repository }}:transcribe
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Manual-only, same reasoning as with_demucs/with_transcribe above.
+      # WITH_TRANSCRIBE stays false here -- a combined Whisper+translate
+      # build is a one-line edit to this step's build-args if/when someone
+      # actually wants that, not a tag worth building by default.
+      - if: ${{ inputs.with_translate }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: WITH_TRANSLATE=true
+          tags: ghcr.io/${{ github.repository }}:translate
           cache-from: type=gha
           cache-to: type=gha,mode=max

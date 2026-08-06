@@ -53,6 +53,20 @@ RUN if [ "$WITH_DEMUCS" = "true" ]; then pip install --no-cache-dir demucs; fi
 ARG WITH_TRANSCRIBE=false
 RUN if [ "$WITH_TRANSCRIBE" = "true" ]; then pip install --no-cache-dir faster-whisper; fi
 
+# Phase 8: argos-translate (offline NMT subtitle translation) -- chosen over
+# a cloud translation API specifically to keep this app self-hosted, no API
+# key, no call ever leaving the box. Pulls in ctranslate2 (same backend as
+# faster-whisper above) plus, as of argostranslate 1.11, a transitive
+# stanza/torch dependency for sentence-boundary detection -- heavier than
+# WITH_TRANSCRIBE alone (verified: ~1.3GB installed, torch included even
+# though this app only ever calls the plain per-cue translate() API, not
+# stanza's sentence splitter). Still gated the same way, same reasoning.
+# Language-pair models are NOT baked in here; they're downloaded into
+# TRANSLATE_MODEL_DIR (under /data, the persistent volume) the first time a
+# given pair is used -- see worker.get_argos_translator.
+ARG WITH_TRANSLATE=false
+RUN if [ "$WITH_TRANSLATE" = "true" ]; then pip install --no-cache-dir argostranslate; fi
+
 COPY app ./app
 
 ENV DOWNLOADS_DIR=/downloads \
