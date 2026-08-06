@@ -227,6 +227,26 @@ async def api_job_files(job_id: int):
     return {"files": files}
 
 
+@app.get("/api/jobs/{job_id}/vtt/{filename}")
+async def api_job_subtitle_vtt(job_id: int, filename: str):
+    """SRT->WebVTT conversion for the in-browser player's <track> elements
+    -- browsers only accept WebVTT there, not SRT, which is what every
+    subtitle file this app has is stored as. filename is matched against
+    this job's own list_job_files() output (the same safe boundary
+    /api/jobs/{id}/files already uses), not resolved as an arbitrary path,
+    so this can't be used to read anything outside what that job already
+    exposes."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    paths = await asyncio.to_thread(worker.list_job_files, job)
+    match = next((p for p in paths if os.path.basename(p) == filename), None)
+    if not match or not match.endswith(".srt"):
+        raise HTTPException(404, "subtitle file not found for this job")
+    vtt_text = await asyncio.to_thread(worker.srt_to_vtt, match)
+    return Response(content=vtt_text, media_type="text/vtt")
+
+
 @app.post("/api/jobs/{job_id}/regen-subs")
 async def api_regen_subs(job_id: int, req: RegenSubsRequest):
     """Re-runs Whisper/OCR/translate against the file already on disk --

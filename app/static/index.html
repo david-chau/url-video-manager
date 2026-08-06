@@ -239,6 +239,20 @@
   </div>
 </div>
 
+<div id="playerModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.8); z-index:10">
+  <div class="modal-box" style="max-width:900px; margin:5vh auto; padding:16px; border-radius:8px; max-height:90vh; display:flex; flex-direction:column">
+    <div class="controls" style="margin-top:0">
+      <strong id="playerModalTitle" style="font-size:14px"></strong>
+      <span class="spacer"></span>
+      <button id="playerModalClose" type="button">Close</button>
+    </div>
+    <div style="margin-top:8px">
+      <video id="playerVideo" controls style="width:100%; max-height:70vh; background:#000"></video>
+    </div>
+    <p class="hint" style="margin:6px 0 0">Use the player's CC/subtitles button to pick a track. (Audio-only files play here too -- &lt;audio&gt; elements don't support a caption picker in most browsers, &lt;video&gt; does even with no picture.)</p>
+  </div>
+</div>
+
 <table id="jobsTable">
   <thead>
     <tr>
@@ -352,6 +366,11 @@ function actionsCell(j) {
   } else if (j.status === 'done') {
     const url = fileUrl(j.filepath);
     if (url) btns.push(`<a href="${url}" target="_blank"><button>Open</button></a>`);
+    // In-browser player with a real subtitle-track picker (HTML5 <track>,
+    // converted from .srt to WebVTT server-side). 'Open' just hands the
+    // browser a bare file URL -- no UI for external subs, and inconsistent
+    // support for embedded ones depending on codec/container.
+    btns.push(`<button data-act="play" data-id="${j.id}">Play&hellip;</button>`);
     // Lists every artifact (main file + every .srt sidecar) as individually
     // downloadable -- 'Open' only ever surfaced the main muxed file, and
     // subtitle sidecars had no download path in the UI at all before this.
@@ -461,6 +480,38 @@ jobsBody.addEventListener('click', async (e) => {
       $('#logModal').style.display = 'block';
       return;
     }
+    if (act === 'play') {
+      const j = jobsById.get(Number(id));
+      $('#playerModalTitle').textContent = j?.title || j?.url || `job ${id}`;
+      const videoEl = $('#playerVideo');
+      videoEl.pause();
+      videoEl.innerHTML = '';
+      videoEl.removeAttribute('src');
+      $('#playerModal').style.display = 'block';
+      try {
+        const { files } = await api(`/api/jobs/${id}/files`);
+        const mainUrl = fileUrl(j?.filepath);
+        if (mainUrl) videoEl.src = mainUrl;
+        // Label tracks by stripping the shared filename stem -- "Title
+        // [id].zh-en.srt" -> "zh-en", "Title [id].ocr.en.srt" -> "ocr.en".
+        const mainBase = j?.filepath ? j.filepath.split('/').pop().replace(/\.[^.]+$/, '') : null;
+        for (const f of files) {
+          if (!f.name.endsWith('.srt')) continue;
+          const label = (mainBase && f.name.startsWith(mainBase + '.'))
+            ? f.name.slice(mainBase.length + 1, -4)
+            : f.name;
+          const track = document.createElement('track');
+          track.kind = 'subtitles';
+          track.label = label;
+          track.src = `/api/jobs/${id}/vtt/${encodeURIComponent(f.name)}`;
+          videoEl.appendChild(track);
+        }
+        videoEl.play().catch(() => {}); // autoplay can be blocked -- fine, controls are visible
+      } catch (err) {
+        alert(err.message);
+      }
+      return;
+    }
     if (act === 'files') {
       const j = jobsById.get(Number(id));
       $('#filesModalTitle').textContent = j?.title || j?.url || `job ${id}`;
@@ -508,6 +559,17 @@ $('#logModalClose').addEventListener('click', () => { $('#logModal').style.displ
 $('#logModal').addEventListener('click', (e) => { if (e.target.id === 'logModal') $('#logModal').style.display = 'none'; });
 $('#filesModalClose').addEventListener('click', () => { $('#filesModal').style.display = 'none'; });
 $('#filesModal').addEventListener('click', (e) => { if (e.target.id === 'filesModal') $('#filesModal').style.display = 'none'; });
+
+function closePlayer() {
+  $('#playerModal').style.display = 'none';
+  const v = $('#playerVideo');
+  v.pause();
+  v.removeAttribute('src');
+  v.innerHTML = '';
+  v.load(); // release the media resource, don't leave it buffering in the background
+}
+$('#playerModalClose').addEventListener('click', closePlayer);
+$('#playerModal').addEventListener('click', (e) => { if (e.target.id === 'playerModal') closePlayer(); });
 
 $('#deleteSelected').addEventListener('click', async () => {
   const ids = [...document.querySelectorAll('.rowcheck:checked')].map(cb => Number(cb.dataset.id));

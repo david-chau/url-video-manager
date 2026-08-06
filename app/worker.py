@@ -977,6 +977,31 @@ def write_srt(cues: list[tuple[float, float, str]], path: str) -> None:
     out.save(path, encoding="utf-8")
 
 
+def srt_to_vtt(srt_path: str) -> str:
+    """Converts an .srt sidecar to WebVTT text, in memory -- the browser's
+    native <track kind="subtitles"> element only accepts WebVTT, not SRT,
+    which is otherwise what every subtitle track this app produces or
+    downloads is stored as. Structurally the formats are nearly identical:
+    a 'WEBVTT' header line, and '.' instead of ',' as the millisecond
+    separator, are the only real differences. All of this app's own .srt
+    files are UTF-8 (yt-dlp writes UTF-8, write_srt writes UTF-8, the 6c
+    upload path decodes to UTF-8 before saving) -- pysrt's default read
+    encoding is correct here, unlike the upload path's own raw bytes,
+    which go through decode_srt_bytes first for exactly that reason."""
+    subs = pysrt.open(srt_path)
+    lines = ["WEBVTT", ""]
+    for item in subs:
+        start, end = item.start, item.end
+        lines.append(
+            f"{int(start.hours):02d}:{int(start.minutes):02d}:{int(start.seconds):02d}.{int(start.milliseconds):03d}"
+            " --> "
+            f"{int(end.hours):02d}:{int(end.minutes):02d}:{int(end.seconds):02d}.{int(end.milliseconds):03d}"
+        )
+        lines.append(item.text)
+        lines.append("")
+    return "\n".join(lines)
+
+
 def ocr_frames_to_cues(
     frame_texts: list[tuple[float, str]], frame_interval: float, similarity: float = 0.6,
 ) -> list[tuple[float, float, str]]:

@@ -802,6 +802,24 @@ def test_p9_list_job_files():
     print("ok: list_job_files finds every sidecar sharing a job's filename stem")
 
 
+def test_p9_srt_to_vtt():
+    d = tempfile.mkdtemp(prefix="uvm-vtt-test-")
+    srt_path = os.path.join(d, "sample.srt")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write(
+            "1\n00:00:01,500 --> 00:00:03,250\nHello world\n\n"
+            "2\n00:00:04,000 --> 00:00:05,010\n你好\n\n"
+        )
+    vtt = worker.srt_to_vtt(srt_path)
+    assert vtt.startswith("WEBVTT\n\n"), "must start with the WebVTT header line"
+    assert "00:00:01.500 --> 00:00:03.250" in vtt, "'.' not ',' as the ms separator"
+    assert "00:00:04.000 --> 00:00:05.010" in vtt
+    assert "Hello world" in vtt
+    assert "你好" in vtt
+    assert "," not in vtt.split("\n\n", 1)[1], "no leftover SRT-style comma timestamps"
+    print("ok: srt_to_vtt produces a valid WebVTT header and '.' millisecond separators")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
