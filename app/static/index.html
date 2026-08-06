@@ -81,6 +81,39 @@
     .modal-body { background: #1a1a1a; border-color: #333; color: #ddd; }
     .field-group { border-color: #333; }
   }
+
+  /* Below this width a wide table is unusable even with horizontal
+     scroll -- one-handed, you'd be swiping sideways to read a single
+     row. Collapse it into a stack of full-width cards instead: hide the
+     header (its columns don't apply to a stacked layout), let each <td>
+     take the full row and label itself via data-label (set in
+     rowHtml()), and drop the desktop min-width that exists specifically
+     to keep the scrolling-table layout from collapsing -- it would fight
+     this rule for the exact same property, and must come after it in
+     source order to win (same cascade rule the dark-mode fix depended
+     on: same-specificity plain selectors resolve by position, not by
+     which query "sounds" more specific). */
+  @media (max-width: 640px) {
+    #jobsTable { min-width: 0; }
+    #jobsTable thead { display: none; }
+    #jobsTable, #jobsTable tbody, #jobsTable tr, #jobsTable td { display: block; width: 100%; }
+    #jobsTable tr { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin-bottom: 10px; }
+    #jobsTable tr.child { margin-left: 16px; border-left: 3px solid #2563eb; }
+    #jobsTable tr.child td:first-of-type { padding-left: 6px; }
+    #jobsTable td { border: none; padding: 4px 2px; }
+    #jobsTable td[data-label]:not([data-label=""])::before {
+      content: attr(data-label);
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: #888;
+    }
+    #jobsTable td:first-child { padding-bottom: 0; }
+  }
+  @media (max-width: 640px) and (prefers-color-scheme: dark) {
+    #jobsTable tr { border-color: #333; }
+  }
 </style>
 
 <h1>
@@ -498,12 +531,16 @@ function rowHtml(j, isChild) {
     ? `<a href="${escapeHtml(j.url)}" target="_blank" rel="noopener" title="Open the original source URL">${titleText}</a>`
     : titleText;
   const prefix = isChild ? '└ ' : (j.kind === 'playlist' ? '▾ ' : '');
+  // data-label backs the ::before pseudo-element that labels each field
+  // once the table collapses into stacked cards on narrow screens (see
+  // the @media rule) -- a plain horizontal-scroll table was still hard to
+  // use one-handed on a phone even once it stopped visually breaking.
   return `<tr class="${isChild ? 'child' : ''}" data-row-id="${j.id}">
-    <td><input type="checkbox" class="rowcheck" data-id="${j.id}"></td>
-    <td>${prefix}${title}</td>
-    <td><span class="status status-${j.status}">${statusLabel(j)}</span></td>
-    <td>${progressCell(j)}</td>
-    <td>${actionsCell(j)}</td>
+    <td data-label=""><input type="checkbox" class="rowcheck" data-id="${j.id}"></td>
+    <td data-label="Title">${prefix}${title}</td>
+    <td data-label="Status"><span class="status status-${j.status}">${statusLabel(j)}</span></td>
+    <td data-label="Progress">${progressCell(j)}</td>
+    <td data-label="Actions">${actionsCell(j)}</td>
   </tr>`;
 }
 

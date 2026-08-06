@@ -28,14 +28,17 @@ DOWNLOADS_DIR = os.environ.get("DOWNLOADS_DIR", "/downloads")
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
 
 
+def _timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def log_line(msg: str) -> None:
     """Every stdout line the app prints -- job errors, startup recovery --
     goes through this so they're all consistently timestamped. `docker
     logs` timestamps are opt-in (--timestamps) and mark receipt time, not
     necessarily when the underlying event happened; this puts the
     timestamp in the line itself regardless of how logs get viewed."""
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    print(f"[{_timestamp()}] {msg}", flush=True)
 
 # Phase 5: vocal separation gets its own semaphore, completely independent
 # of the download semaphore -- a CPU-bound demucs run must never block, or
@@ -234,18 +237,29 @@ class JobLogger:
     def _prefix(self) -> str:
         return f"[job {self.job_id}] " if self.job_id is not None else ""
 
+    def _append(self, msg: str) -> str:
+        # Every line stored (not just what's printed to stdout) gets a
+        # timestamp -- log_line only ever timestamped stdout, so the UI's
+        # Log modal (which reads this stored text, not stdout) showed none
+        # at all. Same format as log_line's stdout lines, for the same
+        # reason: direct correlation between the two if you're looking at
+        # both.
+        line = f"[{_timestamp()}] {msg}"
+        self.lines.append(line)
+        return line
+
     def debug(self, msg):
-        self.lines.append(msg)
+        self._append(msg)
 
     def info(self, msg):
-        self.lines.append(msg)
+        self._append(msg)
 
     def warning(self, msg):
-        self.lines.append(f"WARNING: {msg}")
+        self._append(f"WARNING: {msg}")
         log_line(f"{self._prefix()}WARNING: {msg}")
 
     def error(self, msg):
-        self.lines.append(f"ERROR: {msg}")
+        self._append(f"ERROR: {msg}")
         log_line(f"{self._prefix()}ERROR: {msg}")
 
     def dump(self) -> str:
@@ -1140,7 +1154,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         detected_lang = getattr(info, "language", "?")
         log_line(f"[job {job_id}] whisper: model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
         prior_log = job.get("log") or ""
-        db.update_job(job_id, log=(prior_log + f"\nwhisper: model={WHISPER_MODEL!r} detected_lang={detected_lang!r}")[-8192:])
+        db.update_job(job_id, log=(prior_log + f"\n[{_timestamp()}] whisper: model={WHISPER_MODEL!r} detected_lang={detected_lang!r}")[-8192:])
 
         cues = []
         last_flush = 0.0
@@ -1202,7 +1216,7 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
     # without needing docker logs at all.
     log_line(f"[job {job_id}] ocr: lang={lang!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
     prior_log = job.get("log") or ""
-    db.update_job(job_id, log=(prior_log + f"\nocr: lang={lang!r} sample_fps={fps}")[-8192:])
+    db.update_job(job_id, log=(prior_log + f"\n[{_timestamp()}] ocr: lang={lang!r} sample_fps={fps}")[-8192:])
     tmpdir = tempfile.mkdtemp(prefix=f"ocr-{job_id}-")
     try:
         pct = OCR_CROP_BOTTOM_PCT
