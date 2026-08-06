@@ -1131,6 +1131,16 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
         segments, info = model.transcribe(audio_src, language=job.get("gen_subs_lang") or None)
         total = info.duration or 0
+        # Same reasoning as run_ocr_transcribe's log line -- which model and
+        # which language (hint vs. auto-detected) actually ran is the first
+        # thing worth knowing when a transcript looks wrong, visible from
+        # the UI's Log button. getattr, not info.language directly -- this
+        # is a diagnostic line, not worth risking an unhandled AttributeError
+        # over if a future faster-whisper version renames the field.
+        detected_lang = getattr(info, "language", "?")
+        log_line(f"[job {job_id}] whisper: model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
+        prior_log = job.get("log") or ""
+        db.update_job(job_id, log=(prior_log + f"\nwhisper: model={WHISPER_MODEL!r} detected_lang={detected_lang!r}")[-8192:])
 
         cues = []
         last_flush = 0.0
@@ -1185,6 +1195,14 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
 
     fps = OCR_SAMPLE_FPS
     lang = ocr_lang_for(job.get("gen_subs_lang"))
+    # Recorded both to stdout and the job's own DB log -- the single most
+    # useful line for diagnosing a bad OCR result after the fact (was this
+    # run actually using the fixed chi_sim+chi_tra+eng, or a stale image/
+    # compose file's old chi_sim+eng?), visible from the UI's Log button
+    # without needing docker logs at all.
+    log_line(f"[job {job_id}] ocr: lang={lang!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
+    prior_log = job.get("log") or ""
+    db.update_job(job_id, log=(prior_log + f"\nocr: lang={lang!r} sample_fps={fps}")[-8192:])
     tmpdir = tempfile.mkdtemp(prefix=f"ocr-{job_id}-")
     try:
         pct = OCR_CROP_BOTTOM_PCT
