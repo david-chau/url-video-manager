@@ -9,6 +9,10 @@ on:
         description: "Also build/push the WITH_DEMUCS=true (vocal-stripping) variant, tagged :demucs. Pulls ~2GB of torch, slow."
         type: boolean
         default: false
+      with_transcribe:
+        description: "Also build/push the WITH_TRANSCRIBE=true (Whisper hardsub ASR) variant, tagged :transcribe."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -65,5 +69,19 @@ jobs:
           push: true
           build-args: WITH_DEMUCS=true
           tags: ghcr.io/${{ github.repository }}:demucs
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Manual-only, same reasoning as with_demucs above: faster-whisper's
+      # ctranslate2 backend is expected to fare better than torch on a
+      # non-AVX CPU but this hasn't been proven on the actual NAS hardware.
+      - if: ${{ inputs.with_transcribe }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: WITH_TRANSCRIBE=true
+          tags: ghcr.io/${{ github.repository }}:transcribe
           cache-from: type=gha
           cache-to: type=gha,mode=max

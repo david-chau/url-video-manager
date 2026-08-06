@@ -40,6 +40,20 @@ async def lifespan(app: FastAPI):
     if sep_jobs:
         print(f"[startup] resumed/requeued {len(sep_jobs)} separating job(s)")
 
+    # Phase 7: same resumable-in-place treatment for 'transcribing' -- a job
+    # interrupted mid-Whisper/OCR has a complete source file on disk (post-
+    # separation if strip_vocals ran), and neither engine is meaningfully
+    # resumable mid-run anyway, so restart the stage from scratch rather
+    # than requeue from the top.
+    tr_jobs = await asyncio.to_thread(db.get_jobs_by_status, "transcribing")
+    for job in tr_jobs:
+        if job.get("filepath") and os.path.exists(job["filepath"]):
+            asyncio.create_task(worker.resume_transcribe(job))
+        else:
+            await asyncio.to_thread(db.update_job, job["id"], status="queued", filepath=None)
+    if tr_jobs:
+        print(f"[startup] resumed/requeued {len(tr_jobs)} transcribing job(s)")
+
     stop_event = asyncio.Event()
     task = asyncio.create_task(worker.queue_loop(stop_event))
     try:
@@ -85,6 +99,8 @@ class AddJobRequest(BaseModel):
     merge_subs: bool = False         # Phase 6a
     sub_primary: str | None = None   # e.g. 'zh' -- top line
     sub_secondary: str | None = None  # e.g. 'en' -- bottom line
+    gen_subs: str = "off"            # Phase 7 -- off|whisper|ocr|both
+    gen_subs_lang: str | None = None  # e.g. 'zh' -- hint for both engines
 
 
 class BulkJobRequest(BaseModel):
@@ -98,6 +114,8 @@ class BulkJobRequest(BaseModel):
     merge_subs: bool = False
     sub_primary: str | None = None
     sub_secondary: str | None = None
+    gen_subs: str = "off"
+    gen_subs_lang: str | None = None
     force: bool = False
 
 
@@ -116,7 +134,7 @@ def _create_job(
     url: str, kind: str, quality: str, subs: str | None, embed_subs: bool,
     strip_vocals: bool = False, merge_subs: bool = False,
     sub_primary: str | None = None, sub_secondary: str | None = None,
-    container: str = "mp4",
+    container: str = "mp4", gen_subs: str = "off", gen_subs_lang: str | None = None,
 ) -> dict:
     """Playlist classification is explicit, done at insert time -- not
     guessed at download time. Phase 1's noplaylist=True stays on every
@@ -126,15 +144,21 @@ def _create_job(
     strip_vocals is a no-op on anything but kind='audio' -- clamp it here
     rather than trust the client, same reasoning as kind being the only
     source of truth for audio-vs-video. container gets the same treatment:
-    an unrecognized value falls back to mp4 rather than reaching yt-dlp."""
+    an unrecognized value falls back to mp4 rather than reaching yt-dlp.
+    gen_subs='ocr'/'both' needs video frames that don't exist for an
+    audio-only job -- clamped down to 'whisper' here the same way."""
     cls = worker.classify_url(url)
     strip_vocals = bool(strip_vocals) and kind == "audio"
     if container not in worker.CONTAINER_CHOICES:
         container = "mp4"
+    if gen_subs not in ("off", "whisper", "ocr", "both"):
+        gen_subs = "off"
+    if kind == "audio" and gen_subs in ("ocr", "both"):
+        gen_subs = "whisper"
     common = dict(
         subs=subs, embed_subs=int(embed_subs), strip_vocals=int(strip_vocals),
         merge_subs=int(bool(merge_subs)), sub_primary=sub_primary, sub_secondary=sub_secondary,
-        container=container,
+        container=container, gen_subs=gen_subs, gen_subs_lang=gen_subs_lang,
     )
     if cls == "playlist":
         job_id = db.insert_job(
@@ -164,6 +188,7 @@ async def api_add_job(req: AddJobRequest):
     return await asyncio.to_thread(
         _create_job, req.url.strip(), req.kind, req.quality, req.subs, req.embed_subs,
         req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
+        req.gen_subs, req.gen_subs_lang,
     )
 
 
@@ -176,6 +201,7 @@ async def api_bulk_add(req: BulkJobRequest):
         job = await asyncio.to_thread(
             _create_job, url, req.kind, req.quality, req.subs, req.embed_subs,
             req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
+            req.gen_subs, req.gen_subs_lang,
         )
         added.append(job)
     return {"added": added, "duplicates": dupes}

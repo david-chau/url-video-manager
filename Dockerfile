@@ -4,7 +4,18 @@ FROM python:3.12-slim
 # (Phase 6's mux later reuses the same binary). curl+unzip are only needed
 # to install Deno below, not at runtime, but removing them after would save
 # a few MB for a lot of extra Dockerfile complexity -- not worth it here.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg curl unzip \
+#
+# tesseract-ocr + chi-sim/chi-tra language packs (Phase 7's OCR hardsub
+# pipeline) are installed unconditionally here, unlike WITH_DEMUCS/
+# WITH_TRANSCRIBE below -- pure C, no AVX/torch crash risk on the target
+# Synology's non-AVX Celeron, and small (~15-40MB for these two packs).
+# PaddleOCR would carry the same AVX risk as torch/demucs and isn't used
+# here; Tesseract's Chinese accuracy is noticeably weaker than PaddleOCR's.
+# # ponytail: one OCR engine, not a second engine behind its own flag --
+# # swap in PaddleOCR (its own build ARG, same shape as WITH_DEMUCS) if
+# # real-world accuracy turns out to matter enough to justify it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg curl unzip tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-chi-tra \
     && rm -rf /var/lib/apt/lists/*
 
 # YouTube requires solving a JS "n challenge" to unlock real (non-image-only)
@@ -30,6 +41,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 # instead of hanging (see worker.run_separation).
 ARG WITH_DEMUCS=false
 RUN if [ "$WITH_DEMUCS" = "true" ]; then pip install --no-cache-dir demucs; fi
+
+# Phase 7: Whisper (speech-to-text ASR) transcription. faster-whisper's
+# ctranslate2 backend, not the PyTorch reference implementation -- better
+# CPU perf/memory, and ctranslate2 has a better track record than raw torch
+# on older/non-AVX CPUs (see the plan's Synology section: torch is
+# documented to hard-crash with "Illegal instruction" on a non-AVX CPU;
+# verify ctranslate2 doesn't before relying on this on the actual NAS, don't
+# just assume). Same shape as WITH_DEMUCS above: fails fast with a clear
+# error at job time instead of being installed unconditionally.
+ARG WITH_TRANSCRIBE=false
+RUN if [ "$WITH_TRANSCRIBE" = "true" ]; then pip install --no-cache-dir faster-whisper; fi
 
 COPY app ./app
 

@@ -35,7 +35,7 @@
   .status-done { color: #15803d; }
   .status-error { color: #b91c1c; }
   .status-canceled { color: #b45309; }
-  .status-running, .status-expanding, .status-muxing, .status-separating { color: #2563eb; }
+  .status-running, .status-expanding, .status-muxing, .status-separating, .status-transcribing { color: #2563eb; }
   .status-queued { color: #666; }
   .meta { color: #888; font-size: 12px; }
   .row-actions button { margin-right: 4px; }
@@ -141,6 +141,15 @@
     <label>subs: <input type="text" id="subs" placeholder="en,pt" size="10"></label>
     <label><input type="checkbox" id="embedSubs" checked> embed</label>
     <label id="stripVocalsLabel"><input type="checkbox" id="stripVocals" disabled> strip vocals</label>
+    <label title="Generate an .srt for videos with only burned-in (hardsub) subtitles. whisper transcribes the audio; ocr reads the on-screen subtitle pixels (video jobs only, heavier).">
+      gen subs: <select id="genSubs">
+        <option value="off" selected>off</option>
+        <option value="whisper">whisper</option>
+        <option value="ocr">ocr</option>
+        <option value="both">both</option>
+      </select>
+    </label>
+    <label>lang hint: <input type="text" id="genSubsLang" placeholder="zh" size="4"></label>
     <span class="spacer"></span>
     <button id="probeBtn">Probe formats&hellip;</button>
     <button id="addBtn" class="primary">Add</button>
@@ -274,7 +283,7 @@ function actionsCell(j) {
   if (j.status === 'queued') {
     btns.push(`<button data-act="cancel" data-id="${j.id}">Cancel</button>`);
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
-  } else if (['running', 'expanding', 'muxing', 'separating'].includes(j.status)) {
+  } else if (['running', 'expanding', 'muxing', 'separating', 'transcribing'].includes(j.status)) {
     btns.push(`<button data-act="cancel" data-id="${j.id}">Cancel</button>`);
   } else if (j.status === 'done') {
     const url = fileUrl(j.filepath);
@@ -427,6 +436,17 @@ function updateFormState() {
   if (!isAudio) stripEl.checked = false;
   $('#container').disabled = isAudio;
 
+  // ocr/both need video frames that don't exist for an audio-only job --
+  // grey those two options out rather than the whole control (whisper still
+  // works fine on audio). Mirrored server-side in main.py's _create_job.
+  const genSubsEl = $('#genSubs');
+  for (const opt of genSubsEl.options) {
+    opt.disabled = isAudio && (opt.value === 'ocr' || opt.value === 'both');
+  }
+  if (isAudio && (genSubsEl.value === 'ocr' || genSubsEl.value === 'both')) {
+    genSubsEl.value = 'whisper';
+  }
+
   const langs = subLangs();
   const canMerge = langs.length >= 2;
   const mergeEl = $('#mergeSubs');
@@ -456,6 +476,8 @@ function formValues() {
     merge_subs: $('#mergeSubs').checked,
     sub_primary: $('#mergeSubs').checked ? $('#subPrimary').value : null,
     sub_secondary: $('#mergeSubs').checked ? $('#subSecondary').value : null,
+    gen_subs: $('#genSubs').value,
+    gen_subs_lang: $('#genSubsLang').value.trim() || null,
   };
 }
 

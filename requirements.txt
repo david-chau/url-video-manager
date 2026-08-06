@@ -19,3 +19,12 @@ charset-normalizer
 
 # multipart form parsing for the 6c subtitle-upload endpoint.
 python-multipart
+
+# Phase 7: OCR hardsub pipeline. pytesseract wraps the tesseract CLI binary
+# (installed unconditionally via apt in the Dockerfile -- pure C, no AVX/
+# torch risk on the non-AVX Synology target, unlike Whisper below). No
+# compiled deps of its own; Pillow rides along as pytesseract's own
+# dependency. faster-whisper is NOT here -- like demucs, it's heavy/risky
+# enough to gate behind a Dockerfile build ARG (WITH_TRANSCRIBE) instead of
+# always installing.
+pytesseract

@@ -15,7 +15,7 @@ os.environ["DOWNLOADS_DIR"] = os.path.join(_tmpdir, "downloads")
 os.makedirs(os.environ["DOWNLOADS_DIR"], exist_ok=True)
 
 import pysrt  # noqa: E402
-from app import db, worker  # noqa: E402
+from app import db, main, worker  # noqa: E402
 from yt_dlp.utils import DownloadCancelled  # noqa: E402
 
 
@@ -504,6 +504,147 @@ def test_p6_mux_argv_construction():
     cmd_video = worker.build_mux_cmd("/downloads/v.mkv", tracks[:1], "/downloads/v.mkv", copy_all=True)
     assert "0" in cmd_video and "0:a" not in cmd_video
     print("ok: ffmpeg mux argv construction for N subtitle languages")
+
+
+# --------------------------------------------------------------------- P7
+
+def test_p7_write_srt_format():
+    d = tempfile.mkdtemp(prefix="uvm-srt-test-")
+    out = os.path.join(d, "out.srt")
+    cues = [(0.0, 1.5, "hello"), (1.5, 3.75, "world\nsecond line")]
+    worker.write_srt(cues, out)
+    subs = pysrt.open(out)
+    assert len(subs) == 2
+    assert subs[0].index == 1 and subs[1].index == 2
+    assert subs[0].start.ordinal == 0 and subs[0].end.ordinal == 1500
+    assert subs[1].start.ordinal == 1500 and subs[1].end.ordinal == 3750
+    assert subs[1].text == "world\nsecond line"
+    print("ok: write_srt produces correctly indexed/timestamped cues")
+
+
+def test_p7_ocr_frames_to_cues_merge():
+    """Synthetic (timestamp, raw_ocr_text) samples at a 0.5s frame interval,
+    including OCR noise (trailing whitespace / doubled internal spaces)
+    between frames that should still merge as 'the same line'."""
+    frame_interval = 0.5
+    frames = [
+        (0.0, "Hello there  "),      # cue 1, frame 1
+        (0.5, "Hello there"),        # cue 1, frame 2 (whitespace noise only)
+        (1.0, ""),                   # blank -- subtitle off-screen, closes cue 1
+        (1.5, "  "),                 # still blank
+        (2.0, "Second line"),        # cue 2, frame 1
+        (2.5, "Second line"),        # cue 2, frame 2
+        (3.0, "Third line"),         # text changed -- closes cue 2, opens cue 3
+    ]
+    cues = worker.ocr_frames_to_cues(frames, frame_interval)
+    assert cues == [
+        (0.0, 1.0, "Hello there"),
+        (2.0, 3.0, "Second line"),
+        (3.0, 3.5, "Third line"),
+    ], cues
+    print("ok: ocr_frames_to_cues merges matching-text frames, skips blanks, splits on change")
+
+
+def test_p7_ocr_lang_for():
+    assert worker.ocr_lang_for(None) == worker.OCR_LANG
+    assert worker.ocr_lang_for("zh") == "chi_sim+eng"
+    assert worker.ocr_lang_for("zh-Hans") == "chi_sim+eng"
+    assert worker.ocr_lang_for("en") == "eng"
+    assert worker.ocr_lang_for("fr") == worker.OCR_LANG  # unmapped -> fall back to default
+    print("ok: ocr_lang_for maps zh/en, falls back to OCR_LANG for everything else")
+
+
+def test_p7_missing_whisper_fails_fast():
+    fresh_db()
+    job_id = db.insert_job(url="https://example.com/show", kind="video", status="transcribing")
+    job = db.get_job(job_id)
+    try:
+        import faster_whisper  # noqa: F401
+        print("skip: faster-whisper is actually installed here, can't exercise the not-enabled path")
+        return
+    except ImportError:
+        pass
+    result = worker.run_whisper_transcribe(job, "/nonexistent/src.mp4", "/nonexistent/out.srt")
+    assert result["status"] == "error"
+    assert "WITH_TRANSCRIBE=true" in result["error"]
+    print("ok: missing faster-whisper fails fast with a clear error")
+
+
+def test_p7_missing_tesseract_fails_fast():
+    fresh_db()
+    job_id = db.insert_job(url="https://example.com/show", kind="video", status="transcribing")
+    job = db.get_job(job_id)
+    import shutil as _shutil
+    if _shutil.which("tesseract") is not None:
+        print("skip: tesseract is actually installed here, can't exercise the not-on-PATH path")
+        return
+    result = worker.run_ocr_transcribe(job, "/nonexistent/src.mp4", "/nonexistent/out.srt")
+    assert result["status"] == "error"
+    assert "tesseract" in result["error"].lower()
+    print("ok: missing tesseract binary fails fast with a clear error")
+
+
+def test_p7_independent_transcribe_semaphore():
+    """TRANSCRIBE_SEM must be a third, fully independent semaphore -- not
+    aliased to DOWNLOAD_SEM or SEPARATION_SEM. CPU-heavy Whisper/OCR work
+    must never block, or be blocked by, downloads or vocal separation."""
+    assert worker.TRANSCRIBE_SEM is not worker.DOWNLOAD_SEM
+    assert worker.TRANSCRIBE_SEM is not worker.SEPARATION_SEM
+
+    async def check():
+        acquired = 0
+        for _ in range(worker.MAX_CONCURRENT):
+            await worker.DOWNLOAD_SEM.acquire()
+            acquired += 1
+        await worker.SEPARATION_SEM.acquire()
+        try:
+            assert worker.DOWNLOAD_SEM.locked()
+            assert worker.SEPARATION_SEM.locked()
+            got = await asyncio.wait_for(worker.TRANSCRIBE_SEM.acquire(), timeout=0.5)
+            assert got
+            worker.TRANSCRIBE_SEM.release()
+        finally:
+            worker.SEPARATION_SEM.release()
+            for _ in range(acquired):
+                worker.DOWNLOAD_SEM.release()
+
+    asyncio.run(check())
+    print("ok: TRANSCRIBE_SLOTS is independent of both MAX_CONCURRENT and SEPARATION_SLOTS")
+
+
+def test_p7_gen_subs_clamped_for_audio():
+    fresh_db()
+    # ocr/both need video frames that don't exist for an audio-only job --
+    # main.py's _create_job clamps both down to 'whisper', mirroring how it
+    # already clamps strip_vocals/container.
+    job = main._create_job(
+        "https://example.com/song", "audio", "best", None, True, gen_subs="ocr",
+    )
+    assert job["gen_subs"] == "whisper"
+
+    job2 = main._create_job(
+        "https://example.com/song2", "audio", "best", None, True, gen_subs="both",
+    )
+    assert job2["gen_subs"] == "whisper"
+
+    # whisper-only and off pass through unchanged for audio
+    job3 = main._create_job(
+        "https://example.com/song3", "audio", "best", None, True, gen_subs="whisper",
+    )
+    assert job3["gen_subs"] == "whisper"
+
+    # video jobs are unrestricted
+    job4 = main._create_job(
+        "https://example.com/vid", "video", "best", None, True, gen_subs="ocr",
+    )
+    assert job4["gen_subs"] == "ocr"
+
+    # unrecognized value falls back to 'off' rather than reaching the worker
+    job5 = main._create_job(
+        "https://example.com/vid2", "video", "best", None, True, gen_subs="garbage",
+    )
+    assert job5["gen_subs"] == "off"
+    print("ok: gen_subs='ocr'/'both' clamped to 'whisper' for kind='audio', unrecognized values fall back to 'off'")
 
 
 if __name__ == "__main__":

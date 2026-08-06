@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   parent_id INTEGER,                       -- playlist child -> parent row
   child_kind TEXT,                         -- kind='playlist' rows only: video|audio to give children
   status TEXT NOT NULL DEFAULT 'queued',
-  -- queued|expanding|running|separating|muxing|done|error|canceled
+  -- queued|expanding|running|separating|transcribing|muxing|done|error|canceled
   progress REAL DEFAULT 0,
   stage TEXT, stage_i INTEGER, stage_n INTEGER,   -- "video 1 of 2"
   speed TEXT, eta TEXT,
@@ -52,15 +52,26 @@ CREATE INDEX IF NOT EXISTS idx_parent ON jobs(parent_id);
 # default there.
 _ADD_CONTAINER = "ALTER TABLE jobs ADD COLUMN container TEXT NOT NULL DEFAULT 'mp4';"
 
+# Phase 7: hardsub subtitle generation (Whisper ASR / Tesseract OCR) for
+# reuploads that only have burned-in subtitles. gen_subs: NULL/'off'
+# (default, no generation), 'whisper', 'ocr', or 'both'. gen_subs_lang is an
+# optional hint (e.g. 'zh') fed to both Whisper's language= param and OCR's
+# tesseract lang-pack selection.
+_ADD_GEN_SUBS = (
+    "ALTER TABLE jobs ADD COLUMN gen_subs TEXT;"
+    "ALTER TABLE jobs ADD COLUMN gen_subs_lang TEXT;"
+)
+
 # Append-only: each entry is applied once, in order, tracked via
 # PRAGMA user_version. Future phases append here, never edit past entries.
-MIGRATIONS = [SCHEMA, _ADD_CONTAINER]
+MIGRATIONS = [SCHEMA, _ADD_CONTAINER, _ADD_GEN_SUBS]
 
 # Columns writers are allowed to touch via update_job(); keeps callers from
 # typo-ing a column name into a silent no-op.
 _JOB_COLUMNS = {
     "url", "title", "kind", "quality", "container", "subs", "embed_subs", "strip_vocals",
-    "merge_subs", "sub_primary", "sub_secondary", "parent_id", "child_kind",
+    "merge_subs", "sub_primary", "sub_secondary", "gen_subs", "gen_subs_lang",
+    "parent_id", "child_kind",
     "status", "progress", "stage", "stage_i", "stage_n", "speed", "eta",
     "filepath", "error", "log",
 }
@@ -176,9 +187,10 @@ def delete_job(job_id: int) -> None:
 
 def reset_stuck_jobs() -> int:
     """Startup recovery. running/expanding/muxing get requeued -- yt-dlp's
-    continuedl resumes the .part file. 'separating' is deliberately excluded:
-    that status doesn't exist until Phase 5, and resetting it there would
-    throw away a completed download."""
+    continuedl resumes the .part file. 'separating' and 'transcribing' are
+    deliberately excluded: those statuses don't exist until Phase 5/7, and
+    resetting them here would throw away a completed download (and, for
+    transcribing, a possibly-already-finished separation step too)."""
     conn = get_conn()
     cur = conn.execute(
         "UPDATE jobs SET status='queued', updated_at=datetime('now') "

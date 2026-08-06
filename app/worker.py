@@ -37,6 +37,23 @@ KEEP_VOCALS = os.environ.get("KEEP_VOCALS", "") == "1"
 DOWNLOAD_SEM = asyncio.Semaphore(MAX_CONCURRENT)
 SEPARATION_SEM = asyncio.Semaphore(SEPARATION_SLOTS)
 
+# Phase 7: hardsub subtitle generation (Whisper ASR / Tesseract OCR) gets its
+# own semaphore too, same reasoning as SEPARATION_SEM -- this is CPU-heavy
+# work that must not starve, or be starved by, the I/O-bound download queue.
+# Independent of both DOWNLOAD_SEM and SEPARATION_SEM.
+TRANSCRIBE_SLOTS = int(os.environ.get("TRANSCRIBE_SLOTS", "1"))
+TRANSCRIBE_SEM = asyncio.Semaphore(TRANSCRIBE_SLOTS)
+# small/fast fallback if 'small' proves too slow on the Synology's Celeron;
+# see WITH_TRANSCRIBE in the Dockerfile for the gate that makes this usable
+# at all.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+OCR_SAMPLE_FPS = float(os.environ.get("OCR_SAMPLE_FPS", "2"))
+OCR_CROP_BOTTOM_PCT = float(os.environ.get("OCR_CROP_BOTTOM_PCT", "0.22"))
+# Tesseract's '+'-joined multi-language syntax. Used when the job has no
+# gen_subs_lang hint, or the hint doesn't match one of the small set of
+# mappings in ocr_lang_for() below.
+OCR_LANG = os.environ.get("OCR_LANG", "chi_sim+eng")
+
 # Job ids the user has asked to cancel. Checked on every progress_hook fire.
 CANCELED: set[int] = set()
 
@@ -861,6 +878,278 @@ def decode_srt_bytes(raw: bytes) -> str:
     return str(best)
 
 
+# --------------------------------------------------------- transcribe (P7)
+#
+# Hardsub subtitle generation for reuploads that only have burned-in
+# subtitles: Whisper (ASR, transcribes spoken audio) and/or Tesseract OCR
+# (reads the actual burned-in pixels off sampled frames). Both produce a
+# plain .srt that feeds into the exact same collect_sub_tracks/run_mux
+# machinery as a downloaded or bilingual-merged track above -- this section
+# only needs to get from "job + a source file" to "(path, iso-lang, title)
+# tuples", the muxing itself is unchanged.
+
+_OCR_LANG_HINTS = {"zh": "chi_sim+eng", "en": "eng"}
+
+
+def ocr_lang_for(gen_subs_lang: str | None) -> str:
+    """Small, deliberately partial mapping from a job's language hint to a
+    Tesseract '+'-joined lang string -- not a general-purpose table for
+    every possible language, just the realistic cases. Falls back to
+    OCR_LANG for anything else."""
+    if not gen_subs_lang:
+        return OCR_LANG
+    return _OCR_LANG_HINTS.get(gen_subs_lang.split("-")[0].lower(), OCR_LANG)
+
+
+def write_srt(cues: list[tuple[float, float, str]], path: str) -> None:
+    """cues: (start_seconds, end_seconds, text). Shared by both the Whisper
+    and OCR pipelines so SRT timestamp formatting (HH:MM:SS,mmm) and index
+    numbering aren't written twice."""
+    out = pysrt.SubRipFile()
+    for i, (start, end, text) in enumerate(cues, start=1):
+        out.append(pysrt.SubRipItem(
+            index=i,
+            start=pysrt.SubRipTime(seconds=start),
+            end=pysrt.SubRipTime(seconds=end),
+            text=text,
+        ))
+    out.save(path, encoding="utf-8")
+
+
+def ocr_frames_to_cues(frame_texts: list[tuple[float, str]], frame_interval: float) -> list[tuple[float, float, str]]:
+    """Pure merge logic, unit-tested with synthetic input -- no real
+    tesseract/ffmpeg involved. Normalization is strip + collapse internal
+    whitespace only (not punctuation -- OCR punctuation noise between
+    otherwise-identical frames is a known source of spurious cue splits;
+    # ponytail: not normalized further until real usage shows it matters,
+    # a fuzzy/edit-distance match is the upgrade path).
+
+    frame_texts: (timestamp_seconds, raw_ocr_text) for every sampled frame,
+    in timestamp order. Blank (whitespace-only) frames close and skip any
+    open cue -- that's "no subtitle showing". Consecutive frames whose
+    normalized text matches extend the current cue through to that frame's
+    timestamp + one frame_interval (covering the gap to the next sample);
+    a text change closes the current cue and opens a new one."""
+    def norm(s: str) -> str:
+        return " ".join(s.split())
+
+    cues: list[tuple[float, float, str]] = []
+    cur_text: str | None = None
+    cur_start = cur_end = 0.0
+    for ts, raw in frame_texts:
+        t = norm(raw)
+        if not t:
+            if cur_text is not None:
+                cues.append((cur_start, cur_end + frame_interval, cur_text))
+                cur_text = None
+            continue
+        if t == cur_text:
+            cur_end = ts
+            continue
+        if cur_text is not None:
+            cues.append((cur_start, cur_end + frame_interval, cur_text))
+        cur_text, cur_start, cur_end = t, ts, ts
+    if cur_text is not None:
+        cues.append((cur_start, cur_end + frame_interval, cur_text))
+    return cues
+
+
+def extract_audio_wav(job_id: int, src: str, out_wav: str) -> None:
+    """ffmpeg mono 16kHz wav -- Whisper's expected input. Popen (not
+    subprocess.run) and registered in _thread_proc so request_cancel can
+    kill it mid-extraction, same tracking run_separation uses for demucs.
+    Raises subprocess.CalledProcessError on a genuine failure; caller checks
+    CANCELED separately to tell a kill apart from a real error."""
+    cmd = ["ffmpeg", "-y", "-i", src, "-ar", "16000", "-ac", "1", "-vn", out_wav]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _thread_proc[threading.get_ident()] = proc
+    _, stderr = proc.communicate()
+    if job_id in CANCELED:
+        return
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr)
+
+
+def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> dict:
+    """Blocking. kind='video' jobs get their audio extracted to a temp mono
+    16kHz wav first; kind='audio' jobs transcribe current_filepath directly
+    (whatever file is current post-separation). Caller
+    (worker._run_transcribe_stage) runs this under TRANSCRIBE_SEM."""
+    job_id = job["id"]
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        msg = "speech-to-text not enabled -- rebuild with WITH_TRANSCRIBE=true"
+        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        return {"status": "error", "error": msg}
+
+    tmpdir = None
+    audio_src = current_filepath
+    try:
+        if job["kind"] != "audio":
+            tmpdir = tempfile.mkdtemp(prefix=f"whisper-{job_id}-")
+            audio_src = os.path.join(tmpdir, "audio.wav")
+            extract_audio_wav(job_id, current_filepath, audio_src)
+            if job_id in CANCELED:
+                return {"status": "canceled", "error": "canceled by user"}
+
+        model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        segments, info = model.transcribe(audio_src, language=job.get("gen_subs_lang") or None)
+        total = info.duration or 0
+
+        cues = []
+        last_flush = 0.0
+        for seg in segments:
+            if job_id in CANCELED:
+                return {"status": "canceled", "error": "canceled by user"}
+            text = seg.text.strip()
+            if text:
+                cues.append((seg.start, seg.end, text))
+            now = time.monotonic()
+            if now - last_flush >= 1.0:
+                pct = min(100.0, seg.end / total * 100.0) if total else 0.0
+                db.update_job(job_id, progress=round(pct, 1), stage="transcribing (whisper)")
+                last_flush = now
+
+        if not cues:
+            msg = "whisper produced no cues (silent audio, or an unsupported/mismatched language hint)"
+            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            return {"status": "error", "error": msg}
+        write_srt(cues, out_srt)
+        return {"status": "done", "path": out_srt}
+    except subprocess.CalledProcessError as e:
+        msg = f"ffmpeg audio extraction failed: {e}"
+        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        return {"status": "error", "error": msg}
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
+    """Blocking. Samples frames from video_src via ffmpeg (cropped to the
+    bottom OCR_CROP_BOTTOM_PCT of the frame, at OCR_SAMPLE_FPS), OCRs each
+    with pytesseract, and merges consecutive matching-text frames into cues
+    via ocr_frames_to_cues. Caller (worker._run_transcribe_stage) runs this
+    under TRANSCRIBE_SEM. Only ever called for kind='video' jobs -- there
+    are no frames on an audio-only job, and main.py's _create_job clamps
+    gen_subs='ocr'/'both' down to 'whisper' before a job like that is ever
+    created."""
+    job_id = job["id"]
+    if shutil.which("tesseract") is None:
+        # Shouldn't happen -- tesseract-ocr is installed unconditionally in
+        # the Dockerfile, not gated behind a build flag like demucs/whisper
+        # -- but defend anyway rather than let pytesseract raise an opaque
+        # FileNotFoundError partway through a frame loop.
+        msg = "tesseract binary not found on PATH"
+        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        return {"status": "error", "error": msg}
+
+    import pytesseract
+    from PIL import Image  # Pillow: pytesseract's own dependency, not ours
+
+    fps = OCR_SAMPLE_FPS
+    lang = ocr_lang_for(job.get("gen_subs_lang"))
+    tmpdir = tempfile.mkdtemp(prefix=f"ocr-{job_id}-")
+    try:
+        pct = OCR_CROP_BOTTOM_PCT
+        vf = f"fps={fps},crop=iw:ih*{pct}:0:ih*(1-{pct})"
+        cmd = ["ffmpeg", "-y", "-i", video_src, "-vf", vf, "-q:v", "2", os.path.join(tmpdir, "%06d.png")]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _thread_proc[threading.get_ident()] = proc
+        _, stderr = proc.communicate()
+        if job_id in CANCELED:
+            return {"status": "canceled", "error": "canceled by user"}
+        if proc.returncode != 0:
+            msg = f"ffmpeg frame extraction failed: {stderr.decode(errors='replace')[-500:]}"
+            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            return {"status": "error", "error": msg}
+
+        frames = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+        if not frames:
+            msg = "ocr: ffmpeg extracted no frames"
+            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            return {"status": "error", "error": msg}
+
+        frame_interval = 1.0 / fps
+        frame_texts = []
+        last_flush = 0.0
+        for i, name in enumerate(frames):
+            if job_id in CANCELED:
+                return {"status": "canceled", "error": "canceled by user"}
+            text = pytesseract.image_to_string(Image.open(os.path.join(tmpdir, name)), lang=lang)
+            frame_texts.append((i * frame_interval, text))
+            now = time.monotonic()
+            if now - last_flush >= 1.0:
+                db.update_job(job_id, progress=round((i + 1) / len(frames) * 100.0, 1), stage="transcribing (ocr)")
+                last_flush = now
+
+        cues = ocr_frames_to_cues(frame_texts, frame_interval)
+        if not cues:
+            msg = "ocr produced no cues (no burned-in subtitle text detected)"
+            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            return {"status": "error", "error": msg}
+        write_srt(cues, out_srt)
+        return {"status": "done", "path": out_srt}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
+    """Blocking. Runs whichever of whisper/ocr job['gen_subs'] asks for
+    ('whisper'|'ocr'|'both') and returns the (path, iso-lang, title) tuples
+    to hand to collect_sub_tracks/run_mux alongside downloaded/merged
+    tracks. Sets _job_thread so the ffmpeg/tesseract subprocesses spawned
+    below are cancelable the same way run_separation's demucs call is."""
+    job_id = job["id"]
+    _job_thread[job_id] = threading.get_ident()
+    lang_hint = job.get("gen_subs_lang")
+    iso = iso639_2(lang_hint) if lang_hint else "und"
+    want = job.get("gen_subs") or "off"
+    tracks: list[tuple[str, str, str]] = []
+    try:
+        if want in ("whisper", "both"):
+            out_srt = f"{orig_base}.whisper.srt"
+            result = run_whisper_transcribe(job, current_filepath, out_srt)
+            if result["status"] != "done":
+                return result
+            tracks.append((out_srt, iso, "whisper" if lang_hint else "whisper (auto)"))
+
+        # kind='audio' has no frames -- main.py already clamps ocr/both down
+        # to whisper at job-creation time, so this only guards a stale row
+        # from before that clamp existed (or a hand-edited DB row).
+        if want in ("ocr", "both") and job["kind"] == "video":
+            out_srt = f"{orig_base}.ocr.srt"
+            result = run_ocr_transcribe(job, current_filepath, out_srt)
+            if result["status"] != "done":
+                return result
+            tracks.append((out_srt, iso, "ocr" if lang_hint else "ocr (auto)"))
+
+        if not tracks:
+            return {"status": "error", "error": "no subtitle tracks generated"}
+        return {"status": "done", "tracks": tracks}
+    finally:
+        _job_thread.pop(job_id, None)
+        _thread_proc.pop(threading.get_ident(), None)
+        CANCELED.discard(job_id)
+
+
+async def _run_transcribe_stage(job: dict, orig_base: str, current_filepath: str) -> list[tuple[str, str, str]] | None:
+    """Runs whisper/OCR under TRANSCRIBE_SEM and writes status='transcribing'
+    to the DB while it runs. Returns the (path, iso-lang, title) tuples
+    generated, or None if the job ended in error/canceled (already written
+    to the DB here, same shape as _run_separation_stage)."""
+    job_id = job["id"]
+    db.update_job(job_id, status="transcribing", progress=0)
+    async with TRANSCRIBE_SEM:
+        result = await asyncio.to_thread(run_transcribe, job, current_filepath, orig_base)
+    if result.get("status") in ("error", "canceled"):
+        db.update_job(job_id, status=result["status"], error=result.get("error"))
+        CANCELED.discard(job_id)
+        return None
+    return result["tracks"]
+
+
 async def _run_separation_stage(job: dict, orig_filepath: str) -> str | None:
     """Runs demucs under SEPARATION_SEM and writes the resulting status/
     filepath to the DB. Returns the novocals filepath on success, or None
@@ -878,13 +1167,23 @@ async def _run_separation_stage(job: dict, orig_filepath: str) -> str | None:
     return sep_result["filepath"]
 
 
-async def _run_subs_and_mux_stage(job: dict, orig_filepath: str, current_filepath: str, info: dict | None) -> None:
+async def _run_subs_and_mux_stage(
+    job: dict, orig_base: str, current_filepath: str, info: dict | None,
+    generated_tracks: list[tuple[str, str, str]] | None = None,
+) -> None:
     """Bilingual merge (6a) then muxing: audio jobs get subs muxed in
     manually since yt-dlp's embed postprocessor only works on video
     containers (6b); video jobs with a merged track get it added as one
-    more subtitle stream alongside what yt-dlp already embedded (6a)."""
+    more subtitle stream alongside what yt-dlp already embedded (6a).
+    generated_tracks (Phase 7 -- Whisper/OCR) is just more tuples in the
+    same list, fed to the same collect_sub_tracks/run_mux call either way.
+
+    orig_base is the pre-pipeline filename stem (no extension) -- callers
+    compute it once: os.path.splitext(orig_filepath)[0] for a job running
+    fresh, resolve_orig_base(job) when resuming after a restart (the job's
+    filepath may already be post-separation by the time it's resumed)."""
     job_id = job["id"]
-    orig_base = os.path.splitext(orig_filepath)[0]
+    generated_tracks = generated_tracks or []
     merged_srt = None
     if job.get("subs") and job.get("merge_subs"):
         logger = JobLogger(job_id)
@@ -893,8 +1192,11 @@ async def _run_subs_and_mux_stage(job: dict, orig_filepath: str, current_filepat
             prior = job.get("log") or ""
             db.update_job(job_id, log=(prior + "\n" + logger.dump())[-8192:])
 
-    if job["kind"] == "audio" and job.get("subs") and job.get("embed_subs"):
-        sub_tracks = collect_sub_tracks(job, orig_base, merged_srt)
+    if job["kind"] == "audio":
+        sub_tracks = []
+        if job.get("subs") and job.get("embed_subs"):
+            sub_tracks = collect_sub_tracks(job, orig_base, merged_srt)
+        sub_tracks = sub_tracks + generated_tracks
         if sub_tracks:
             db.update_job(job_id, status="muxing")
             stem = os.path.splitext(current_filepath)[0]
@@ -902,13 +1204,17 @@ async def _run_subs_and_mux_stage(job: dict, orig_filepath: str, current_filepat
             await asyncio.to_thread(run_mux, current_filepath, sub_tracks, out_path, False)
             db.update_job(job_id, status="done", filepath=out_path, progress=100.0)
             return
-    elif job["kind"] == "video" and merged_srt:
-        title = f"{job['sub_primary']}+{job['sub_secondary']}"
-        track = [(merged_srt, iso639_2(job["sub_primary"]), title)]
-        db.update_job(job_id, status="muxing")
-        await asyncio.to_thread(run_mux, current_filepath, track, current_filepath, True)
-        db.update_job(job_id, status="done", progress=100.0)
-        return
+    elif job["kind"] == "video":
+        tracks = []
+        if merged_srt:
+            title = f"{job['sub_primary']}+{job['sub_secondary']}"
+            tracks.append((merged_srt, iso639_2(job["sub_primary"]), title))
+        tracks += generated_tracks
+        if tracks:
+            db.update_job(job_id, status="muxing")
+            await asyncio.to_thread(run_mux, current_filepath, tracks, current_filepath, True)
+            db.update_job(job_id, status="done", progress=100.0)
+            return
 
     db.update_job(job_id, status="done", progress=100.0)
 
@@ -924,10 +1230,38 @@ async def resume_separation(job: dict) -> None:
     # and retry from scratch if that matters for a given job.
     """
     orig_filepath = job["filepath"]
+    orig_base = os.path.splitext(orig_filepath)[0]
     current_filepath = await _run_separation_stage(job, orig_filepath)
     if current_filepath is None:
         return
-    await _run_subs_and_mux_stage(job, orig_filepath, current_filepath, None)
+    generated_tracks = None
+    if job.get("gen_subs") and job["gen_subs"] not in (None, "off"):
+        generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
+        if generated_tracks is None:
+            return
+    await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
+
+
+async def resume_transcribe(job: dict) -> None:
+    """Startup recovery for a 'transcribing' row whose source file still
+    exists on disk: like demucs, Whisper/OCR aren't meaningfully resumable
+    mid-run, so this restarts the stage from scratch and continues through
+    the same mux stage a fresh job would hit -- it does not re-download or
+    re-run separation (job['filepath'] is already whatever separation left
+    behind, if strip_vocals ran). resolve_orig_base recovers the true
+    pre-pipeline stem regardless of whether separation already ran, the
+    same way resume_separation's caller in main.py resolves it for a job
+    stuck earlier in the pipeline.
+    # ponytail: the yt-dlp info dict doesn't survive a restart here either,
+    # same as resume_separation -- a resumed merge_subs job skips rollup
+    # dedup, see that docstring for why.
+    """
+    orig_base = resolve_orig_base(job)
+    current_filepath = job["filepath"]
+    generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
+    if generated_tracks is None:
+        return
+    await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
 
 
 # -------------------------------------------------------------- queue loop
@@ -960,13 +1294,19 @@ async def _process_job(job: dict) -> None:
 async def _continue_after_download(job: dict, info: dict | None) -> None:
     job_id = job["id"]
     orig_filepath = job["filepath"]
+    orig_base = os.path.splitext(orig_filepath)[0]
     current_filepath = orig_filepath
     try:
         if job["kind"] == "audio" and job.get("strip_vocals"):
             current_filepath = await _run_separation_stage(job, orig_filepath)
             if current_filepath is None:
                 return  # error/canceled already written by _run_separation_stage
-        await _run_subs_and_mux_stage(job, orig_filepath, current_filepath, info)
+        generated_tracks = None
+        if job.get("gen_subs") and job["gen_subs"] not in (None, "off"):
+            generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
+            if generated_tracks is None:
+                return  # error/canceled already written by _run_transcribe_stage
+        await _run_subs_and_mux_stage(job, orig_base, current_filepath, info, generated_tracks)
     except Exception as e:
         print(f"[job {job_id}] ERROR: {type(e).__name__}: {e}", flush=True)
         db.update_job(job_id, status="error", error=f"{type(e).__name__}: {e}")

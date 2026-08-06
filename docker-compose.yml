@@ -5,6 +5,11 @@
 # check the plan's Synology section first, non-AVX CPUs may not run torch at
 # all. That variant is manual-only: Actions tab -> Publish image -> Run
 # workflow -> with_demucs, tagged :demucs rather than overwriting :latest.
+# Hardsub subtitle generation (Phase 7, gen_subs='whisper'/'ocr'/'both')
+# needs a WITH_TRANSCRIBE=true build for the Whisper half -- same
+# manual-only :transcribe tag, same non-AVX caveat as demucs (see the
+# Dockerfile's WITH_TRANSCRIBE comment). OCR (tesseract) needs no build
+# flag at all -- it's in every image.
 services:
   app:
     image: ghcr.io/david-chau/url-video-manager:latest
@@ -21,6 +26,11 @@ services:
       DEMUCS_MODEL: "htdemucs"  # mdx_extra_q is faster/lower-quality if htdemucs is too slow
       KEEP_VOCALS: ""           # unset = discard the isolated vocal track; set "1" to keep it alongside novocals
       AUDIO_FORMAT: ""          # unset = passthrough (keep source m4a/opus); set "mp3" to force re-encode
+      TRANSCRIBE_SLOTS: "1"     # Whisper/OCR are CPU-heavy too; own semaphore, independent of MAX_CONCURRENT/SEPARATION_SLOTS
+      WHISPER_MODEL: "small"    # 'base' is the faster/lower-quality fallback if 'small' is too slow on the Celeron
+      OCR_SAMPLE_FPS: "2"       # frames/sec sampled for hardsub OCR
+      OCR_CROP_BOTTOM_PCT: "0.22"  # bottom fraction of the frame OCR'd (where hardsubs almost always sit)
+      OCR_LANG: "chi_sim+eng"  # tesseract '+'-joined lang packs, used when a job has no gen_subs_lang hint
       YTDLP_COOKIES: "/data/cookies.txt"
       APP_PASSWORD: ""          # unset by default; set to require HTTP Basic auth on every route
     # On Synology, uncomment and set to your `id <you>` uid:gid (usually the
