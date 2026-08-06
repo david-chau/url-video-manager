@@ -130,7 +130,37 @@ class ProbeRequest(BaseModel):
     url: str
 
 
+class RegenSubsRequest(BaseModel):
+    # None means "keep whatever's already stored on the job" -- lets the
+    # button just re-run with the current settings (e.g. after the
+    # OCR_LANG fix) without the UI needing to resend every field.
+    gen_subs: str | None = None
+    gen_subs_lang: str | None = None
+    translate_to: str | None = None
+
+
 # ------------------------------------------------------------- helpers
+
+def _clamp_gen_subs(
+    kind: str, gen_subs: str, gen_subs_lang: str | None, translate_to: str | None,
+) -> tuple[str, str | None]:
+    """Shared by _create_job and /regen-subs so the two never drift apart.
+    gen_subs='ocr'/'both' needs video frames that don't exist for an
+    audio-only job -- clamped down to 'whisper'. translate_to (Phase 8)
+    needs a known source language: argos-translate has no language
+    detection of its own, so it rides on gen_subs_lang as that hint. No
+    gen_subs_lang, or nothing being generated in the first place
+    (gen_subs='off'), just turns translation off rather than erroring --
+    clamp-not-reject, same as container/strip_vocals below."""
+    if gen_subs not in ("off", "whisper", "ocr", "both"):
+        gen_subs = "off"
+    if kind == "audio" and gen_subs in ("ocr", "both"):
+        gen_subs = "whisper"
+    translate_to = (translate_to or "").strip() or None
+    if gen_subs == "off" or not gen_subs_lang:
+        translate_to = None
+    return gen_subs, translate_to
+
 
 def _create_job(
     url: str, kind: str, quality: str, subs: str | None, embed_subs: bool,
@@ -147,26 +177,12 @@ def _create_job(
     strip_vocals is a no-op on anything but kind='audio' -- clamp it here
     rather than trust the client, same reasoning as kind being the only
     source of truth for audio-vs-video. container gets the same treatment:
-    an unrecognized value falls back to mp4 rather than reaching yt-dlp.
-    gen_subs='ocr'/'both' needs video frames that don't exist for an
-    audio-only job -- clamped down to 'whisper' here the same way.
-
-    translate_to (Phase 8) needs a known source language: argos-translate
-    has no language detection of its own, so it rides on gen_subs_lang as
-    that hint. No gen_subs_lang, or nothing being generated in the first
-    place (gen_subs='off'), just turns translation off rather than erroring
-    -- same clamp-not-reject style as strip_vocals/container above."""
+    an unrecognized value falls back to mp4 rather than reaching yt-dlp."""
     cls = worker.classify_url(url)
     strip_vocals = bool(strip_vocals) and kind == "audio"
     if container not in worker.CONTAINER_CHOICES:
         container = "mp4"
-    if gen_subs not in ("off", "whisper", "ocr", "both"):
-        gen_subs = "off"
-    if kind == "audio" and gen_subs in ("ocr", "both"):
-        gen_subs = "whisper"
-    translate_to = (translate_to or "").strip() or None
-    if gen_subs == "off" or not gen_subs_lang:
-        translate_to = None
+    gen_subs, translate_to = _clamp_gen_subs(kind, gen_subs, gen_subs_lang, translate_to)
     common = dict(
         subs=subs, embed_subs=int(embed_subs), strip_vocals=int(strip_vocals),
         merge_subs=int(bool(merge_subs)), sub_primary=sub_primary, sub_secondary=sub_secondary,
@@ -209,6 +225,47 @@ async def api_job_files(job_id: int):
         rel = os.path.relpath(p, worker.DOWNLOADS_DIR)
         files.append({"name": os.path.basename(p), "url": "/files/" + rel.replace(os.sep, "/")})
     return {"files": files}
+
+
+@app.post("/api/jobs/{job_id}/regen-subs")
+async def api_regen_subs(job_id: int, req: RegenSubsRequest):
+    """Re-runs Whisper/OCR/translate against the file already on disk --
+    no re-download, no re-running the actual video/audio fetch. This is
+    worker.resume_transcribe (originally built for restart recovery) fired
+    manually instead of automatically; the source file being untouched is
+    exactly the same precondition either way.
+
+    Clean for kind='audio' every time -- that mux step only ever maps the
+    audio stream (-map 0:a), so old subtitle tracks are dropped and fresh
+    ones added, no accumulation. For kind='video' the mux step copies
+    every existing stream (-map 0) and adds new tracks alongside them, so
+    repeated regenerations *do* accumulate extra subtitle streams rather
+    than replacing -- same tradeoff already accepted for the 6c re-upload
+    path (see write_and_process's docstring in api_upload_subtitle).
+    Fine for players that let you pick a track; delete + retry for a
+    guaranteed single-track file."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in ("done", "error", "canceled"):
+        raise HTTPException(400, "job is currently active, cancel it first")
+    if not job.get("filepath") or not os.path.exists(job["filepath"]):
+        raise HTTPException(400, "no downloaded file on disk for this job -- use Retry for a full re-download")
+
+    gen_subs = req.gen_subs if req.gen_subs is not None else (job.get("gen_subs") or "off")
+    gen_subs_lang = req.gen_subs_lang if req.gen_subs_lang is not None else job.get("gen_subs_lang")
+    translate_to = req.translate_to if req.translate_to is not None else job.get("translate_to")
+    gen_subs, translate_to = _clamp_gen_subs(job["kind"], gen_subs, gen_subs_lang, translate_to)
+    if gen_subs == "off":
+        raise HTTPException(400, "nothing to generate -- set gen_subs to whisper/ocr/both first")
+
+    await asyncio.to_thread(
+        db.update_job, job_id, gen_subs=gen_subs, gen_subs_lang=gen_subs_lang, translate_to=translate_to,
+        status="transcribing", progress=0, error=None, stage=None,
+    )
+    updated_job = await asyncio.to_thread(db.get_job, job_id)
+    asyncio.create_task(worker.resume_transcribe(updated_job))
+    return updated_job
 
 
 @app.post("/api/jobs")

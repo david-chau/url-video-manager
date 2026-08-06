@@ -39,6 +39,12 @@
   .status-queued { color: #666; }
   .meta { color: #888; font-size: 12px; }
   .row-actions button { margin-right: 4px; }
+  /* Colors live here, not inline on the modal elements -- an inline
+     style="background:#fff" always wins over any external CSS rule
+     regardless of cascade order (unlike the plain-selector table/button
+     bug fixed earlier), so dark mode has nothing it CAN override there. */
+  .modal-box { background: #fff; }
+  .modal-body { background: #f5f5f5; border: 1px solid #ddd; }
   #probeResults { margin-top: 8px; max-height: 220px; overflow-y: auto; display: none; }
   #probeResults table { font-size: 12px; }
   #probeResults tr { cursor: pointer; }
@@ -166,24 +172,24 @@
 <input type="file" id="subFileInput" accept=".srt" style="display:none">
 
 <div id="logModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10">
-  <div class="modal-box" style="background:#fff; max-width:720px; margin:5vh auto; padding:16px; border-radius:8px; max-height:85vh; display:flex; flex-direction:column">
+  <div class="modal-box" style="max-width:720px; margin:5vh auto; padding:16px; border-radius:8px; max-height:85vh; display:flex; flex-direction:column">
     <div class="controls" style="margin-top:0">
       <strong id="logModalTitle" style="font-size:14px"></strong>
       <span class="spacer"></span>
       <button id="logModalClose" type="button">Close</button>
     </div>
-    <pre id="logModalBody" class="modal-body" style="overflow:auto; font-size:12px; background:#f5f5f5; border:1px solid #ddd; border-radius:4px; padding:8px; white-space:pre-wrap; word-break:break-word; margin-top:8px"></pre>
+    <pre id="logModalBody" class="modal-body" style="overflow:auto; font-size:12px; border-radius:4px; padding:8px; white-space:pre-wrap; word-break:break-word; margin-top:8px"></pre>
   </div>
 </div>
 
 <div id="filesModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10">
-  <div class="modal-box" style="background:#fff; max-width:520px; margin:5vh auto; padding:16px; border-radius:8px; max-height:85vh; display:flex; flex-direction:column">
+  <div class="modal-box" style="max-width:520px; margin:5vh auto; padding:16px; border-radius:8px; max-height:85vh; display:flex; flex-direction:column">
     <div class="controls" style="margin-top:0">
       <strong id="filesModalTitle" style="font-size:14px"></strong>
       <span class="spacer"></span>
       <button id="filesModalClose" type="button">Close</button>
     </div>
-    <div id="filesModalBody" class="modal-body" style="overflow:auto; font-size:13px; background:#f5f5f5; border:1px solid #ddd; border-radius:4px; padding:8px; margin-top:8px"></div>
+    <div id="filesModalBody" class="modal-body" style="overflow:auto; font-size:13px; border-radius:4px; padding:8px; margin-top:8px"></div>
   </div>
 </div>
 
@@ -304,6 +310,12 @@ function actionsCell(j) {
     // downloadable -- 'Open' only ever surfaced the main muxed file, and
     // subtitle sidecars had no download path in the UI at all before this.
     btns.push(`<button data-act="files" data-id="${j.id}">Files&hellip;</button>`);
+    // Re-runs whisper/ocr/translate against the file already on disk --
+    // no re-download. Only shown once a job actually generated something,
+    // for exactly the "the OCR result was wrong, fix and rerun" case.
+    if (j.gen_subs && j.gen_subs !== 'off') {
+      btns.push(`<button data-act="regen-subs" data-id="${j.id}" title="Re-run subtitle generation using this job's already-downloaded file -- no re-download.">Regen subs</button>`);
+    }
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
   } else if (['error', 'canceled'].includes(j.status)) {
     btns.push(`<button data-act="retry" data-id="${j.id}">Retry</button>`);
@@ -317,7 +329,7 @@ function actionsCell(j) {
   // external subtitle upload (Phase 6c) -- only makes sense once there's an
   // output to mux into.
   if (j.kind !== 'playlist' && j.status === 'done') {
-    btns.push(`<button data-act="upload-sub" data-id="${j.id}">Upload subs&hellip;</button>`);
+    btns.push(`<button data-act="upload-sub" data-id="${j.id}" title="Got a better subtitle file from elsewhere (a subtitle site, a manual translation)? Upload it here to embed instead of what was auto-downloaded/generated.">Upload subs&hellip;</button>`);
   }
   // Full log/error text -- the progress cell only ever showed a 40-char
   // truncated error with no way to see the rest. This reads job.log/error
@@ -350,7 +362,10 @@ function render() {
 }
 
 function rowHtml(j, isChild) {
-  const title = escapeHtml(j.title || j.url);
+  const titleText = escapeHtml(j.title || j.url);
+  const title = j.url
+    ? `<a href="${escapeHtml(j.url)}" target="_blank" rel="noopener" title="Open the original source URL">${titleText}</a>`
+    : titleText;
   const prefix = isChild ? '└ ' : (j.kind === 'playlist' ? '▾ ' : '');
   return `<tr class="${isChild ? 'child' : ''}" data-row-id="${j.id}">
     <td><input type="checkbox" class="rowcheck" data-id="${j.id}"></td>
@@ -380,6 +395,15 @@ jobsBody.addEventListener('click', async (e) => {
       pendingSubUploadId = id;
       $('#subFileInput').click();
       return; // upload itself happens in the file input's change handler
+    }
+    if (act === 'regen-subs') {
+      const j = jobsById.get(Number(id));
+      const isVideo = j?.kind === 'video';
+      const warn = isVideo
+        ? ' Note: for video jobs this adds another subtitle track rather than replacing the old one -- pick the right one in your player, or delete + re-add for a single-track file.'
+        : '';
+      if (!confirm(`Re-run subtitle generation (${j?.gen_subs || 'current settings'}) using the file already on disk -- no re-download.${warn}`)) return;
+      await api(`/api/jobs/${id}/regen-subs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     }
     if (act === 'log') {
       const j = jobsById.get(Number(id));
