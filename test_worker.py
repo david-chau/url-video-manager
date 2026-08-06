@@ -594,6 +594,33 @@ def test_p7_ocr_lang_for():
     print("ok: ocr_lang_for maps zh/en, honors an explicit ocr_lang, falls back to OCR_LANG")
 
 
+def test_p7_append_job_log_accumulates_and_trims():
+    fresh_db()
+    job_id = db.insert_job(url="https://example.com/show", kind="video", status="running")
+    worker.append_job_log(job_id, "stage: separating")
+    worker.append_job_log(job_id, "stage: transcribing")
+    log = db.get_job(job_id)["log"]
+    assert "stage: separating" in log and "stage: transcribing" in log, "appends must accumulate, not overwrite"
+    assert log.index("stage: separating") < log.index("stage: transcribing"), "chronological order"
+
+    # The bug this helper exists to kill: appending onto a caller's stale
+    # job dict drops everything written since that dict was fetched. Each
+    # stage holds its own snapshot, so this is the normal case, not a rare
+    # race.
+    stale = db.get_job(job_id)
+    worker.append_job_log(job_id, "stage: muxing")
+    worker.append_job_log(stale["id"], "stage: done")
+    log = db.get_job(job_id)["log"]
+    assert "stage: muxing" in log, "a later append must not clobber an earlier one"
+    assert "stage: done" in log
+
+    worker.append_job_log(job_id, "x" * 9000)
+    log = db.get_job(job_id)["log"]
+    assert len(log) == 8192, f"trimmed to the last 8KB, got {len(log)}"
+    assert log.endswith("x" * 100), "trim keeps the tail, not the head"
+    print("ok: append_job_log accumulates across stages, re-reads the row, trims to the last 8KB")
+
+
 def test_p7_missing_whisper_fails_fast():
     fresh_db()
     job_id = db.insert_job(url="https://example.com/show", kind="video", status="transcribing")

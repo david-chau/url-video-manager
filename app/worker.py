@@ -40,6 +40,23 @@ def log_line(msg: str) -> None:
     timestamp in the line itself regardless of how logs get viewed."""
     print(f"[{_timestamp()}] {msg}", flush=True)
 
+
+def append_job_log(job_id: int, msg: str) -> None:
+    """Timestamped append to a job's own `log` column -- what the UI's Log
+    button shows. Re-reads the row rather than taking a `prior_log` from
+    the caller's job dict: a job dict is a snapshot from whenever the stage
+    started, so appending onto it silently drops every line written since
+    (which is exactly what the pipeline does -- each stage holds its own
+    copy). Trimmed to the last 8KB; the tail is what matters.
+    # ponytail: read-modify-write, no locking. Stages within one job run
+    # strictly in sequence, so the only racer would be two stages of the
+    # SAME job at once, which the pipeline never does. Revisit if that
+    # ever stops being true.
+    """
+    prior = (db.get_job(job_id) or {}).get("log") or ""
+    db.update_job(job_id, log=(prior + f"\n[{_timestamp()}] {msg}")[-8192:])
+
+
 # Phase 5: vocal separation gets its own semaphore, completely independent
 # of the download semaphore -- a CPU-bound demucs run must never block, or
 # be blocked by, I/O-bound downloads. Both are module-level so queue_loop
@@ -1165,8 +1182,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         # over if a future faster-whisper version renames the field.
         detected_lang = getattr(info, "language", "?")
         log_line(f"[job {job_id}] whisper: model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
-        prior_log = job.get("log") or ""
-        db.update_job(job_id, log=(prior_log + f"\n[{_timestamp()}] whisper: model={WHISPER_MODEL!r} detected_lang={detected_lang!r}")[-8192:])
+        append_job_log(job_id, f"whisper: model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
 
         cues = []
         last_flush = 0.0
@@ -1187,6 +1203,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
             log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
         write_srt(cues, out_srt)
+        append_job_log(job_id, f"whisper: {len(cues)} cues -> {os.path.basename(out_srt)}")
         return {"status": "done", "path": out_srt}
     except subprocess.CalledProcessError as e:
         msg = f"ffmpeg audio extraction failed: {e}"
@@ -1227,8 +1244,7 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
     # lang string and which region actually ran), visible from the UI's Log
     # button without needing docker logs at all.
     log_line(f"[job {job_id}] ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
-    prior_log = job.get("log") or ""
-    db.update_job(job_id, log=(prior_log + f"\n[{_timestamp()}] ocr: lang={lang!r} region={region!r} sample_fps={fps}")[-8192:])
+    append_job_log(job_id, f"ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
     tmpdir = tempfile.mkdtemp(prefix=f"ocr-{job_id}-")
     try:
         pct = OCR_CROP_BOTTOM_PCT
@@ -1316,6 +1332,14 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
         write_srt(cues, out_srt)
+        # Frame count alongside cue count: a high blank-frame ratio is the
+        # signature of OCR reading nothing at all, which otherwise looks
+        # identical to a video that simply has few subtitles.
+        blank = sum(1 for _t, txt in frame_texts if not txt.strip())
+        append_job_log(
+            job_id,
+            f"ocr: {len(frames)} frames, {blank} blank, {len(cues)} cues -> {os.path.basename(out_srt)}",
+        )
         return {"status": "done", "path": out_srt}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1493,12 +1517,20 @@ async def _run_transcribe_stage(job: dict, orig_base: str, current_filepath: str
     to the DB here, same shape as _run_separation_stage)."""
     job_id = job["id"]
     db.update_job(job_id, status="transcribing", progress=0)
+    await asyncio.to_thread(
+        append_job_log, job_id,
+        f"stage: transcribing (engine={job.get('gen_subs')!r} lang_hint={job.get('gen_subs_lang')!r}"
+        f" translate_to={job.get('translate_to')!r})",
+    )
     async with TRANSCRIBE_SEM:
         result = await asyncio.to_thread(run_transcribe, job, current_filepath, orig_base)
     if result.get("status") in ("error", "canceled"):
         db.update_job(job_id, status=result["status"], error=result.get("error"))
+        await asyncio.to_thread(append_job_log, job_id, f"stage: transcribing {result['status']}: {result.get('error')}")
         CANCELED.discard(job_id)
         return None
+    names = ", ".join(os.path.basename(p) for p, _lang, _title in result["tracks"])
+    await asyncio.to_thread(append_job_log, job_id, f"stage: transcribing done -- {len(result['tracks'])} track(s): {names}")
     return result["tracks"]
 
 
@@ -1508,14 +1540,17 @@ async def _run_separation_stage(job: dict, orig_filepath: str) -> str | None:
     if the job ended in error/canceled (already written)."""
     job_id = job["id"]
     db.update_job(job_id, status="separating", progress=0)
+    await asyncio.to_thread(append_job_log, job_id, f"stage: separating (model={DEMUCS_MODEL!r})")
     async with SEPARATION_SEM:
         sep_job = {**job, "filepath": orig_filepath}
         sep_result = await asyncio.to_thread(run_separation, sep_job)
     if sep_result.get("status") in ("error", "canceled"):
         db.update_job(job_id, **sep_result)
+        await asyncio.to_thread(append_job_log, job_id, f"stage: separating {sep_result['status']}: {sep_result.get('error')}")
         CANCELED.discard(job_id)
         return None
     db.update_job(job_id, filepath=sep_result["filepath"], progress=100.0)
+    await asyncio.to_thread(append_job_log, job_id, f"stage: separating done -> {os.path.basename(sep_result['filepath'])}")
     return sep_result["filepath"]
 
 
@@ -1541,8 +1576,7 @@ async def _run_subs_and_mux_stage(
         logger = JobLogger(job_id)
         merged_srt = await asyncio.to_thread(merge_bilingual_subs, job, orig_base, info, logger)
         if logger.lines:
-            prior = job.get("log") or ""
-            db.update_job(job_id, log=(prior + "\n" + logger.dump())[-8192:])
+            await asyncio.to_thread(append_job_log, job_id, logger.dump())
 
     if job["kind"] == "audio":
         sub_tracks = []
@@ -1553,8 +1587,11 @@ async def _run_subs_and_mux_stage(
             db.update_job(job_id, status="muxing")
             stem = os.path.splitext(current_filepath)[0]
             out_path = stem + ".mkv"
+            titles = ", ".join(t for _p, _l, t in sub_tracks)
+            await asyncio.to_thread(append_job_log, job_id, f"stage: muxing {len(sub_tracks)} subtitle track(s) [{titles}] -> {os.path.basename(out_path)}")
             await asyncio.to_thread(run_mux, current_filepath, sub_tracks, out_path, False)
             db.update_job(job_id, status="done", filepath=out_path, progress=100.0)
+            await asyncio.to_thread(append_job_log, job_id, "stage: done")
             return
     elif job["kind"] == "video":
         tracks = []
@@ -1564,11 +1601,15 @@ async def _run_subs_and_mux_stage(
         tracks += generated_tracks
         if tracks:
             db.update_job(job_id, status="muxing")
+            titles = ", ".join(t for _p, _l, t in tracks)
+            await asyncio.to_thread(append_job_log, job_id, f"stage: muxing {len(tracks)} subtitle track(s) [{titles}] -> {os.path.basename(current_filepath)}")
             await asyncio.to_thread(run_mux, current_filepath, tracks, current_filepath, True)
             db.update_job(job_id, status="done", progress=100.0)
+            await asyncio.to_thread(append_job_log, job_id, "stage: done")
             return
 
     db.update_job(job_id, status="done", progress=100.0)
+    await asyncio.to_thread(append_job_log, job_id, "stage: done (nothing to mux)")
 
 
 async def resume_separation(job: dict) -> None:

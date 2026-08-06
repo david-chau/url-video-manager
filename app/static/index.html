@@ -287,9 +287,14 @@
     <div class="controls" style="margin-top:0">
       <strong id="logModalTitle" style="font-size:14px"></strong>
       <span class="spacer"></span>
+      <button id="logModalCopy" type="button">Copy</button>
       <button id="logModalClose" type="button">Close</button>
     </div>
-    <pre id="logModalBody" class="modal-body" style="overflow:auto; font-size:12px; border-radius:4px; padding:8px; white-space:pre-wrap; word-break:break-word; margin-top:8px"></pre>
+    <!-- flex:1 + min-height:0 is what actually makes this scroll: a flex
+         item defaults to min-height:auto, so a tall <pre> grows past the
+         85vh modal box instead of scrolling inside it, and overflow:auto
+         alone never kicks in. -->
+    <pre id="logModalBody" class="modal-body" style="flex:1; min-height:0; overflow:auto; font-size:12px; border-radius:4px; padding:8px; white-space:pre-wrap; word-break:break-word; margin-top:8px"></pre>
   </div>
 </div>
 
@@ -300,7 +305,7 @@
       <span class="spacer"></span>
       <button id="filesModalClose" type="button">Close</button>
     </div>
-    <div id="filesModalBody" class="modal-body" style="overflow:auto; font-size:13px; border-radius:4px; padding:8px; margin-top:8px"></div>
+    <div id="filesModalBody" class="modal-body" style="flex:1; min-height:0; overflow:auto; font-size:13px; border-radius:4px; padding:8px; margin-top:8px"></div>
   </div>
 </div>
 
@@ -736,7 +741,16 @@ function renderLogModal(j, id) {
   const parts = [];
   if (j?.error) parts.push(`ERROR: ${j.error}`);
   if (j?.log) parts.push(j.log);
-  $('#logModalBody').textContent = parts.join('\n\n') || '(no log yet)';
+  const body = $('#logModalBody');
+  // Setting textContent resets scrollTop, so a 2s poll would yank you back
+  // to the top every tick while you're reading. Stick to the bottom only
+  // if you were already there (tailing); otherwise hold your position.
+  const wasAtBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 32;
+  const prevTop = body.scrollTop;
+  const text = parts.join('\n\n') || '(no log yet)';
+  if (body.textContent === text) return; // nothing changed, don't touch scroll at all
+  body.textContent = text;
+  body.scrollTop = wasAtBottom ? body.scrollHeight : prevTop;
 }
 
 async function openLogModal(id) {
@@ -764,6 +778,28 @@ function closeLogModal() {
   $('#logModal').style.display = 'none';
   if (logPollTimer) { clearInterval(logPollTimer); logPollTimer = null; }
 }
+$('#logModalCopy').addEventListener('click', async () => {
+  const btn = $('#logModalCopy');
+  const text = $('#logModalBody').textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // navigator.clipboard is undefined on a plain-HTTP origin in most
+    // browsers (secure-context only), which is exactly how this app gets
+    // used -- http://<nas-ip>:1208. Fall back to selecting the text so
+    // the OS copy shortcut still works.
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    const range = document.createRange();
+    range.selectNodeContents($('#logModalBody'));
+    sel.addRange(range);
+    btn.textContent = 'Selected -- press Cmd/Ctrl+C';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 2500);
+    return;
+  }
+  btn.textContent = 'Copied';
+  setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+});
 $('#logModalClose').addEventListener('click', closeLogModal);
 $('#logModal').addEventListener('click', (e) => { if (e.target.id === 'logModal') closeLogModal(); });
 $('#filesModalClose').addEventListener('click', () => { $('#filesModal').style.display = 'none'; });
