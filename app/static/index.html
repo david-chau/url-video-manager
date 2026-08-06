@@ -25,6 +25,11 @@
   button.primary:hover { background: #1d4ed8; }
   button.danger { color: #b91c1c; }
   .spacer { flex: 1; }
+  .field-group { margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee; }
+  .field-group:first-of-type { margin-top: 8px; padding-top: 0; border-top: none; }
+  .field-group-label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; color: #888; margin-bottom: 4px; }
+  .field-group .controls { margin-top: 4px; }
+  .field-group label[title], button[title] { cursor: help; }
   table { width: 100%; border-collapse: collapse; background: #fff; }
   th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; vertical-align: middle; }
   th { color: #888; font-weight: 600; font-size: 12px; text-transform: uppercase; }
@@ -68,6 +73,7 @@
     .bar { background: #333; }
     .modal-box { background: #222; }
     .modal-body { background: #1a1a1a; border-color: #333; color: #ddd; }
+    .field-group { border-color: #333; }
   }
 </style>
 
@@ -126,45 +132,85 @@
 
 <div class="panel">
   <textarea id="urls" placeholder="paste one URL per line, or a playlist URL"></textarea>
-  <div class="controls">
-    <select id="quality">
-      <option value="best">best</option>
-      <option value="1080">1080p</option>
-      <option value="720" selected>720p</option>
-      <option value="480">480p</option>
-    </select>
-    <select id="kind">
-      <option value="video" selected>video</option>
-      <option value="audio">audio only</option>
-    </select>
-    <label title="Source streams are preferred mp4/m4a first either way -- webm is only picked when nothing else exists at the requested quality. Choosing webm here skips that preference and takes the best stream outright.">
-      format: <select id="container">
-        <option value="mp4" selected>mp4</option>
-        <option value="mkv">mkv</option>
-        <option value="webm">webm</option>
-      </select>
-    </label>
-    <label>subs: <input type="text" id="subs" placeholder="en,pt" size="10"></label>
-    <label><input type="checkbox" id="embedSubs" checked> embed</label>
-    <label id="stripVocalsLabel"><input type="checkbox" id="stripVocals" disabled> strip vocals</label>
-    <label title="Generate an .srt for videos with only burned-in (hardsub) subtitles. whisper transcribes the audio; ocr reads the on-screen subtitle pixels (video jobs only, heavier).">
-      gen subs: <select id="genSubs">
-        <option value="off" selected>off</option>
-        <option value="whisper">whisper</option>
-        <option value="ocr">ocr</option>
-        <option value="both">both</option>
-      </select>
-    </label>
-    <label>lang hint: <input type="text" id="genSubsLang" placeholder="zh" size="4"></label>
-    <label title="Translate the generated track into a second language via offline argos-translate. Needs a lang hint above (argos-translate can't detect the source language on its own) -- both tracks are kept, embedded side by side.">translate to: <input type="text" id="translateTo" placeholder="en" size="4" disabled></label>
-    <span class="spacer"></span>
-    <button id="probeBtn">Probe formats&hellip;</button>
-    <button id="addBtn" class="primary">Add</button>
+
+  <div class="field-group">
+    <span class="field-group-label">Download</span>
+    <div class="controls">
+      <label title="Download the full video, or audio only (no video stream, faster, smaller file).">kind:
+        <select id="kind">
+          <option value="video" selected>video</option>
+          <option value="audio">audio only</option>
+        </select>
+      </label>
+      <label title="Maximum resolution -- yt-dlp picks the best available stream at or below this. Ignored for audio.">quality:
+        <select id="quality">
+          <option value="best">best</option>
+          <option value="1080">1080p</option>
+          <option value="720" selected>720p</option>
+          <option value="480">480p</option>
+        </select>
+      </label>
+      <label title="Output container for video jobs. Source streams are preferred mp4/m4a first either way -- webm is only picked when nothing else exists at the requested quality. Choosing webm here skips that preference entirely and takes the best stream outright, whatever codec that is.">format:
+        <select id="container">
+          <option value="mp4" selected>mp4</option>
+          <option value="mkv">mkv</option>
+          <option value="webm">webm</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
+      <button id="probeBtn" title="See every format YouTube actually offers for this URL and pick an exact one, instead of using the quality/format dropdowns above.">Probe formats&hellip;</button>
+    </div>
   </div>
+
+  <div class="field-group">
+    <span class="field-group-label">Subtitles from the video</span>
+    <div class="controls">
+      <label title="Subtitle language(s) to download directly from the video, comma-separated (e.g. en,zh-Hans). Leave blank for none. Only works if the video actually has real subtitle tracks -- see 'Generate subtitles' below for burned-in/hardsub text instead.">subs:
+        <input type="text" id="subs" placeholder="en,pt" size="10">
+      </label>
+      <label title="Embed the downloaded subtitle track(s) directly into the output file, selectable in any player.">
+        <input type="checkbox" id="embedSubs" checked> embed
+      </label>
+      <label title="Combine two of the languages above into one bilingual track, one language's text on top of the other's in each cue. Needs at least 2 languages in subs above.">
+        <input type="checkbox" id="mergeSubs" disabled> merge bilingual
+      </label>
+      <label title="Which requested language appears on the top line of each merged cue.">top: <select id="subPrimary" disabled></select></label>
+      <label title="Which requested language appears on the bottom line of each merged cue.">bottom: <select id="subSecondary" disabled></select></label>
+    </div>
+  </div>
+
+  <div class="field-group">
+    <span class="field-group-label">Generate subtitles (for burned-in/hardsub text, or no real track at all)</span>
+    <div class="controls">
+      <label title="off: don't generate. whisper: transcribes the spoken audio (works for video or audio jobs). ocr: reads the actual burned-in subtitle pixels off video frames (video only, more accurate to on-screen text, heavier). both: run both engines, keep both tracks.">gen subs:
+        <select id="genSubs">
+          <option value="off" selected>off</option>
+          <option value="whisper">whisper</option>
+          <option value="ocr">ocr</option>
+          <option value="both">both</option>
+        </select>
+      </label>
+      <label title="Language of the source audio/hardsub text, e.g. zh. Required for ocr (picks the right character set) and for translate below (whisper can auto-detect on its own, but a hint still helps).">lang hint:
+        <input type="text" id="genSubsLang" placeholder="zh" size="4">
+      </label>
+      <label title="Translate the generated track into a second language via offline argos-translate (no cloud, no API key) -- e.g. en. Needs a lang hint above, since argos-translate can't detect the source language on its own. Both the original and translated tracks are kept, embedded side by side.">translate to:
+        <input type="text" id="translateTo" placeholder="en" size="4" disabled>
+      </label>
+    </div>
+  </div>
+
+  <div class="field-group" id="audioOptionsGroup">
+    <span class="field-group-label">Audio</span>
+    <div class="controls">
+      <label id="stripVocalsLabel" title="Remove vocals from an audio-only download (karaoke-style instrumental), via offline Demucs. Audio jobs only -- needs the WITH_DEMUCS build.">
+        <input type="checkbox" id="stripVocals" disabled> strip vocals
+      </label>
+    </div>
+  </div>
+
   <div class="controls">
-    <label><input type="checkbox" id="mergeSubs" disabled> merge bilingual</label>
-    <label>top: <select id="subPrimary" disabled></select></label>
-    <label>bottom: <select id="subSecondary" disabled></select></label>
+    <span class="spacer"></span>
+    <button id="addBtn" class="primary">Add</button>
   </div>
   <div id="probeResults"></div>
 </div>
@@ -492,6 +538,10 @@ function updateFormState() {
   const stripEl = $('#stripVocals');
   stripEl.disabled = !isAudio;
   if (!isAudio) stripEl.checked = false;
+  // whole section is meaningless for video jobs -- hide it, not just grey
+  // out the one checkbox inside it, so the form doesn't show a section
+  // with nothing usable in it.
+  $('#audioOptionsGroup').style.display = isAudio ? '' : 'none';
   $('#container').disabled = isAudio;
 
   // ocr/both need video frames that don't exist for an audio-only job --

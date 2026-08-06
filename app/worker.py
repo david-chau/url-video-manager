@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 import pysrt
@@ -25,6 +26,16 @@ MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
 AUDIO_FORMAT = os.environ.get("AUDIO_FORMAT")  # unset = passthrough, no re-encode
 DOWNLOADS_DIR = os.environ.get("DOWNLOADS_DIR", "/downloads")
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
+
+
+def log_line(msg: str) -> None:
+    """Every stdout line the app prints -- job errors, startup recovery --
+    goes through this so they're all consistently timestamped. `docker
+    logs` timestamps are opt-in (--timestamps) and mark receipt time, not
+    necessarily when the underlying event happened; this puts the
+    timestamp in the line itself regardless of how logs get viewed."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 # Phase 5: vocal separation gets its own semaphore, completely independent
 # of the download semaphore -- a CPU-bound demucs run must never block, or
@@ -231,11 +242,11 @@ class JobLogger:
 
     def warning(self, msg):
         self.lines.append(f"WARNING: {msg}")
-        print(f"{self._prefix()}WARNING: {msg}", flush=True)
+        log_line(f"{self._prefix()}WARNING: {msg}")
 
     def error(self, msg):
         self.lines.append(f"ERROR: {msg}")
-        print(f"{self._prefix()}ERROR: {msg}", flush=True)
+        log_line(f"{self._prefix()}ERROR: {msg}")
 
     def dump(self) -> str:
         text = "\n".join(self.lines)
@@ -437,7 +448,7 @@ def run_download(job: dict) -> dict:
         # yt-dlp's own logger callback already prints WARNING/ERROR lines as
         # they happen; this covers exceptions that never went through it
         # (e.g. raised before the logger was wired up, or by a postprocessor).
-        print(f"[job {job_id}] ERROR: {type(e).__name__}: {e}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {type(e).__name__}: {e}")
         return {"status": "error", "error": f"{type(e).__name__}: {e}", "log": logger.dump()}
     finally:
         _job_thread.pop(job_id, None)
@@ -493,7 +504,7 @@ def expand_playlist(job: dict) -> None:
                 )
         db.update_job(job_id, status="done", title=info.get("title") or job["url"], progress=100.0, log=logger.dump())
     except Exception as e:
-        print(f"[job {job_id}] ERROR: {type(e).__name__}: {e}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {type(e).__name__}: {e}")
         db.update_job(job_id, status="error", error=f"{type(e).__name__}: {e}", log=logger.dump())
 
 
@@ -585,7 +596,7 @@ def run_separation(job: dict) -> dict:
 
     if shutil.which("demucs") is None:
         msg = "vocal separation not enabled -- rebuild with WITH_DEMUCS=true"
-        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {msg}")
         return {"status": "error", "error": msg}
 
     _job_thread[job_id] = threading.get_ident()
@@ -621,7 +632,7 @@ def run_separation(job: dict) -> dict:
             return {"status": "canceled", "error": "canceled by user"}
         if ret != 0:
             msg = f"demucs exited with status {ret}"
-            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
 
         # Demucs writes nested at {tmpdir}/{model}/{track_stem}/no_vocals.wav,
@@ -630,7 +641,7 @@ def run_separation(job: dict) -> dict:
         novocals_wav = os.path.join(tmpdir, DEMUCS_MODEL, stem, "no_vocals.wav")
         if not os.path.exists(novocals_wav):
             msg = f"demucs output not found: {novocals_wav}"
-            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
 
         ext = AUDIO_FORMAT or os.path.splitext(src)[1].lstrip(".") or "m4a"
@@ -645,7 +656,7 @@ def run_separation(job: dict) -> dict:
 
         return {"status": "done", "progress": 100.0, "filepath": out_path}
     except subprocess.CalledProcessError as e:
-        print(f"[job {job_id}] ERROR: ffmpeg encode failed: {e}", flush=True)
+        log_line(f"[job {job_id}] ERROR: ffmpeg encode failed: {e}")
         return {"status": "error", "error": f"ffmpeg encode failed: {e}"}
     finally:
         _job_thread.pop(job_id, None)
@@ -966,41 +977,90 @@ def write_srt(cues: list[tuple[float, float, str]], path: str) -> None:
     out.save(path, encoding="utf-8")
 
 
-def ocr_frames_to_cues(frame_texts: list[tuple[float, str]], frame_interval: float) -> list[tuple[float, float, str]]:
+def ocr_frames_to_cues(
+    frame_texts: list[tuple[float, str]], frame_interval: float, similarity: float = 0.6,
+) -> list[tuple[float, float, str]]:
     """Pure merge logic, unit-tested with synthetic input -- no real
     tesseract/ffmpeg involved. Normalization is strip + collapse internal
-    whitespace only (not punctuation -- OCR punctuation noise between
-    otherwise-identical frames is a known source of spurious cue splits;
-    # ponytail: not normalized further until real usage shows it matters,
-    # a fuzzy/edit-distance match is the upgrade path).
+    whitespace only (not punctuation).
+
+    Grouping is *fuzzy* (difflib.SequenceMatcher, stdlib, no new
+    dependency), not an exact string match -- verified directly against a
+    real run: OCR on a completely static line of on-screen text produced a
+    different misread on nearly every 0.5s-apart frame (one wrong
+    character each time). Exact matching treated every one of those as a
+    text change, fragmenting a single real 3-second cue into six
+    wrong-duration ones -- this is the actual mechanism behind subtitles
+    coming out visibly mistimed, not just occasionally misspelled. Each
+    frame is compared against its group's current majority-vote reading
+    (not the first frame, which self-corrects as more frames arrive), and
+    a finished cue's text is that group's most common normalized reading,
+    not whichever frame happened to be sampled first.
 
     frame_texts: (timestamp_seconds, raw_ocr_text) for every sampled frame,
     in timestamp order. Blank (whitespace-only) frames close and skip any
-    open cue -- that's "no subtitle showing". Consecutive frames whose
-    normalized text matches extend the current cue through to that frame's
-    timestamp + one frame_interval (covering the gap to the next sample);
-    a text change closes the current cue and opens a new one."""
+    open cue -- that's "no subtitle showing".
+
+    A single dissimilar frame doesn't split a cue by itself -- it's held
+    as `pending` for one more frame first. If the *next* frame matches the
+    cue's majority again, the held frame was just a one-off OCR blip and
+    gets folded back in silently (this is exactly what happens with the
+    real captured noise above: frame 4 of 6 misreads badly, frame 5 reads
+    correctly again). Only two *consecutive* dissimilar frames confirm a
+    genuine cue change, opening the new cue at the first of the two. A
+    trailing pending frame with no next frame to confirm or deny it is
+    kept as its own short cue rather than silently dropped -- we have no
+    evidence either way, and dropping what might be real content is worse
+    than occasionally keeping a spurious one-frame one."""
+    from collections import Counter
+    from difflib import SequenceMatcher
+
     def norm(s: str) -> str:
         return " ".join(s.split())
 
+    def is_similar(a: str, b: str) -> bool:
+        return SequenceMatcher(None, a, b).ratio() >= similarity
+
     cues: list[tuple[float, float, str]] = []
-    cur_text: str | None = None
-    cur_start = cur_end = 0.0
+    group: list[str] = []
+    group_start = group_end = 0.0
+    pending: tuple[float, str] | None = None
+
+    def majority() -> str:
+        return Counter(group).most_common(1)[0][0]
+
+    def flush():
+        if group:
+            cues.append((group_start, group_end + frame_interval, majority()))
+
     for ts, raw in frame_texts:
         t = norm(raw)
         if not t:
-            if cur_text is not None:
-                cues.append((cur_start, cur_end + frame_interval, cur_text))
-                cur_text = None
+            pending = None
+            flush()
+            group = []
             continue
-        if t == cur_text:
-            cur_end = ts
+        if not group:
+            group, group_start, group_end, pending = [t], ts, ts, None
             continue
-        if cur_text is not None:
-            cues.append((cur_start, cur_end + frame_interval, cur_text))
-        cur_text, cur_start, cur_end = t, ts, ts
-    if cur_text is not None:
-        cues.append((cur_start, cur_end + frame_interval, cur_text))
+        if is_similar(t, majority()):
+            pending = None
+            group.append(t)
+            group_end = ts
+            continue
+        if pending is None:
+            pending = (ts, t)
+            continue
+        # second consecutive miss confirms a real cue change, not noise
+        flush()
+        group = [pending[1], t]
+        group_start, group_end = pending[0], ts
+        pending = None
+    if pending is not None:
+        flush()
+        cues.append((pending[0], pending[0] + frame_interval, pending[1]))
+    else:
+        flush()
     return cues
 
 
@@ -1030,7 +1090,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         from faster_whisper import WhisperModel
     except ImportError:
         msg = "speech-to-text not enabled -- rebuild with WITH_TRANSCRIBE=true"
-        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {msg}")
         return {"status": "error", "error": msg}
 
     tmpdir = None
@@ -1063,13 +1123,13 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
 
         if not cues:
             msg = "whisper produced no cues (silent audio, or an unsupported/mismatched language hint)"
-            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
         write_srt(cues, out_srt)
         return {"status": "done", "path": out_srt}
     except subprocess.CalledProcessError as e:
         msg = f"ffmpeg audio extraction failed: {e}"
-        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {msg}")
         return {"status": "error", "error": msg}
     finally:
         if tmpdir:
@@ -1092,7 +1152,7 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
         # -- but defend anyway rather than let pytesseract raise an opaque
         # FileNotFoundError partway through a frame loop.
         msg = "tesseract binary not found on PATH"
-        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {msg}")
         return {"status": "error", "error": msg}
 
     import pytesseract
@@ -1112,13 +1172,13 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             return {"status": "canceled", "error": "canceled by user"}
         if proc.returncode != 0:
             msg = f"ffmpeg frame extraction failed: {stderr.decode(errors='replace')[-500:]}"
-            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
 
         frames = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
         if not frames:
             msg = "ocr: ffmpeg extracted no frames"
-            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
 
         frame_interval = 1.0 / fps
@@ -1127,7 +1187,28 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
         for i, name in enumerate(frames):
             if job_id in CANCELED:
                 return {"status": "canceled", "error": "canceled by user"}
-            text = pytesseract.image_to_string(Image.open(os.path.join(tmpdir, name)), lang=lang)
+            # --psm 7: treat the frame as a single line of text, not a full
+            # page. Skips Tesseract's page-layout analysis entirely, which
+            # is not just wasted work here but actively confusing it --
+            # measured faster AND more accurate on real subtitle-style
+            # crops (verified directly: 0.50s/frame default vs 0.41s/frame
+            # with --psm 7, on the same misread-prone case).
+            #
+            # A brightness/darkness threshold to isolate the text from a
+            # busy background was tried and rejected: it depends on which
+            # side (text vs. outline) is lighter, which varies by hardsub
+            # color -- a fixed threshold that fixed white-on-noisy-video
+            # text produced EMPTY output on blue-on-dark text, and the
+            # reverse polarity failed the same way in reverse. Not safe to
+            # ship without adaptive (e.g. Otsu) per-frame thresholding,
+            # which needs more validation across real subtitle styles than
+            # a couple of synthetic samples can prove.
+            # ponytail: revisit with per-frame Otsu thresholding (picks the
+            # split point from each frame's own histogram, not a fixed
+            # constant) if --psm 7 alone isn't enough in practice.
+            text = pytesseract.image_to_string(
+                Image.open(os.path.join(tmpdir, name)), lang=lang, config="--psm 7",
+            )
             frame_texts.append((i * frame_interval, text))
             now = time.monotonic()
             if now - last_flush >= 1.0:
@@ -1137,7 +1218,7 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
         cues = ocr_frames_to_cues(frame_texts, frame_interval)
         if not cues:
             msg = "ocr produced no cues (no burned-in subtitle text detected)"
-            print(f"[job {job_id}] ERROR: {msg}", flush=True)
+            log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
         write_srt(cues, out_srt)
         return {"status": "done", "path": out_srt}
@@ -1224,11 +1305,11 @@ def run_translate(job: dict, src_srt: str, source_lang: str, target_lang: str, o
     except RuntimeError as e:
         # get_argos_translator's own clear-message failures (not enabled /
         # language pair not available) -- pass the message straight through.
-        print(f"[job {job_id}] ERROR: {e}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {e}")
         return {"status": "error", "error": str(e)}
     except Exception as e:
         msg = f"translation failed: {type(e).__name__}: {e}"
-        print(f"[job {job_id}] ERROR: {msg}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {msg}")
         return {"status": "error", "error": msg}
 
 
@@ -1450,7 +1531,7 @@ async def _dispatch(job: dict) -> None:
         else:
             await _process_job(job)
     except Exception as e:  # never let one bad job kill the loop
-        print(f"[job {job['id']}] ERROR: {type(e).__name__}: {e}", flush=True)
+        log_line(f"[job {job['id']}] ERROR: {type(e).__name__}: {e}")
         db.update_job(job["id"], status="error", error=f"{type(e).__name__}: {e}")
 
 
@@ -1484,7 +1565,7 @@ async def _continue_after_download(job: dict, info: dict | None) -> None:
                 return  # error/canceled already written by _run_transcribe_stage
         await _run_subs_and_mux_stage(job, orig_base, current_filepath, info, generated_tracks)
     except Exception as e:
-        print(f"[job {job_id}] ERROR: {type(e).__name__}: {e}", flush=True)
+        log_line(f"[job {job_id}] ERROR: {type(e).__name__}: {e}")
         db.update_job(job_id, status="error", error=f"{type(e).__name__}: {e}")
 
 

@@ -545,6 +545,34 @@ def test_p7_ocr_frames_to_cues_merge():
     print("ok: ocr_frames_to_cues merges matching-text frames, skips blanks, splits on change")
 
 
+def test_p7_ocr_frames_to_cues_fuzzy_noise():
+    """Reproduces an actual bug found by running the real pipeline end to
+    end against a synthetic video: static on-screen text got OCR'd
+    slightly differently on nearly every 0.5s-apart frame (one wrong
+    character each time -- real Tesseract noise, not a hypothetical).
+    Exact-string matching fragmented one real 3-second cue into six
+    wrong-duration ones. This is real captured frame data from that run,
+    not hand-constructed -- proving the fix against the actual failure,
+    not a sanitized version of it."""
+    frame_interval = 0.5
+    cue1_frames = [
+        (0.0, "儿童玩具剑算是哪笃出啊"),
+        (0.5, "儿童玩具剑算是哪至出啊"),
+        (1.0, "儿童玩具剑算是哪三出啊"),
+        (1.5, "eras Ss = why"),  # one badly garbled frame in the middle
+        (2.0, "儿童玩具剑算是哪皇出啊"),
+        (2.5, "儿童玩具剑算是哪择出啊"),
+    ]
+    frames = cue1_frames + [(3.0, ""), (3.5, "")]  # blank gap between cues
+    cues = worker.ocr_frames_to_cues(frames, frame_interval)
+    assert len(cues) == 1, f"one static line should merge into one cue, got {len(cues)}: {cues}"
+    start, end, text = cues[0]
+    assert start == 0.0
+    assert end == 3.0, f"cue should span the full run, got end={end}"
+    assert text.startswith("儿童玩具剑算是哪"), text
+    print("ok: ocr_frames_to_cues survives real per-frame OCR noise (fuzzy grouping, majority-vote text)")
+
+
 def test_p7_ocr_lang_for():
     # chi_sim+eng (a lone CJK script combined with eng) is a confirmed-bad
     # Tesseract combination -- garbles real text into noise. Must be

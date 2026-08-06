@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(db.init_db)
     n = await asyncio.to_thread(db.reset_stuck_jobs)
     if n:
-        print(f"[startup] requeued {n} interrupted job(s)")
+        worker.log_line(f"[startup] requeued {n} interrupted job(s)")
 
     # 'separating' is deliberately excluded from reset_stuck_jobs (Phase 1):
     # a job interrupted there has a complete source download on disk, and
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
         else:
             await asyncio.to_thread(db.update_job, job["id"], status="queued", filepath=None)
     if sep_jobs:
-        print(f"[startup] resumed/requeued {len(sep_jobs)} separating job(s)")
+        worker.log_line(f"[startup] resumed/requeued {len(sep_jobs)} separating job(s)")
 
     # Phase 7: same resumable-in-place treatment for 'transcribing' -- a job
     # interrupted mid-Whisper/OCR has a complete source file on disk (post-
@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
         else:
             await asyncio.to_thread(db.update_job, job["id"], status="queued", filepath=None)
     if tr_jobs:
-        print(f"[startup] resumed/requeued {len(tr_jobs)} transcribing job(s)")
+        worker.log_line(f"[startup] resumed/requeued {len(tr_jobs)} transcribing job(s)")
 
     stop_event = asyncio.Event()
     task = asyncio.create_task(worker.queue_loop(stop_event))
