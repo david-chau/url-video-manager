@@ -168,7 +168,7 @@
   </div>
 
   <div class="field-group">
-    <span class="field-group-label">Subtitles from the video</span>
+    <span class="field-group-label">Extract/combine existing subtitles from the video</span>
     <div class="controls">
       <label title="Subtitle language(s) to download directly from the video, comma-separated (e.g. en,zh-Hans). Leave blank for none. Only works if the video actually has real subtitle tracks -- see 'Generate subtitles' below for burned-in/hardsub text instead.">subs:
         <input type="text" id="subs" placeholder="en,pt" size="10">
@@ -281,6 +281,12 @@
 <script>
 const $ = (sel) => document.querySelector(sel);
 const jobsBody = $('#jobsBody');
+// Every non-terminal, non-queued status a job can be doing work in --
+// one shared list so the header count and the Cancel-button condition
+// can't drift apart the way they just did (the header only checked
+// 'running', so a transcribing/separating/muxing/expanding job silently
+// didn't count as active at all).
+const ACTIVE_STATUSES = ['running', 'expanding', 'muxing', 'separating', 'transcribing'];
 
 let jobs = [];          // full flat list, latest known state, keyed by id
 let jobsById = new Map();
@@ -410,7 +416,7 @@ function actionsCell(j) {
   if (j.status === 'queued') {
     btns.push(`<button data-act="cancel" data-id="${j.id}">Cancel</button>`);
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
-  } else if (['running', 'expanding', 'muxing', 'separating', 'transcribing'].includes(j.status)) {
+  } else if (ACTIVE_STATUSES.includes(j.status)) {
     btns.push(`<button data-act="cancel" data-id="${j.id}">Cancel</button>`);
   } else if (j.status === 'done') {
     const url = fileUrl(j.filepath);
@@ -470,7 +476,7 @@ function render() {
   }
   jobsBody.innerHTML = rows.join('') || '<tr><td colspan="5" class="meta">No jobs yet.</td></tr>';
 
-  const running = jobs.filter(j => j.status === 'running').length;
+  const running = jobs.filter(j => ACTIVE_STATUSES.includes(j.status)).length;
   const queued = jobs.filter(j => j.status === 'queued').length;
   $('#counts').textContent = `${running} running · ${queued} queued`;
 }
