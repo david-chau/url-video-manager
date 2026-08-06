@@ -1231,9 +1231,23 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             # ponytail: revisit with per-frame Otsu thresholding (picks the
             # split point from each frame's own histogram, not a fixed
             # constant) if --psm 7 alone isn't enough in practice.
-            text = pytesseract.image_to_string(
-                Image.open(os.path.join(tmpdir, name)), lang=lang, config="--psm 7",
-            )
+            # --psm 7 trades away the default mode's tolerance for a
+            # text-free frame: forcing "there is exactly one line here"
+            # onto a crop with no real text can make Tesseract's internal
+            # line-finder latch onto a tiny noise fragment and raise
+            # TesseractError ("Image too small to scale") instead of just
+            # returning "" the way the default full-page mode would have.
+            # Confirmed as a real, input-dependent failure (not one this
+            # synthetic-image testing could force on demand) -- semantically
+            # this frame has no recognizable text, exactly what a blank
+            # result already means to ocr_frames_to_cues, so treat it the
+            # same rather than letting it kill the whole job.
+            try:
+                text = pytesseract.image_to_string(
+                    Image.open(os.path.join(tmpdir, name)), lang=lang, config="--psm 7",
+                )
+            except pytesseract.TesseractError:
+                text = ""
             frame_texts.append((i * frame_interval, text))
             now = time.monotonic()
             if now - last_flush >= 1.0:
