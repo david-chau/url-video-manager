@@ -77,7 +77,12 @@
   }
 </style>
 
-<h1>URL Video Manager <span id="counts"></span></h1>
+<h1>
+  <span>URL Video Manager <span id="counts"></span></span>
+  <label style="font-size:12px; font-weight:normal; color:#888" title="Play a sound when a job finishes or fails">
+    <input type="checkbox" id="soundToggle" checked> sound
+  </label>
+</h1>
 
 <div class="panel" id="cookiesPanel">
   <div class="controls" style="margin-top:0">
@@ -312,6 +317,36 @@ async function loadJobs() {
   render();
 }
 
+// Web Audio oscillator beeps -- no audio file asset needed, keeps the app
+// fully self-contained. Lazily created so the very first tone (which won't
+// fire until some job actually finishes, well after the user has already
+// clicked something on the page) satisfies the browser's autoplay-gesture
+// requirement; the try/catch means a still-blocked context just stays
+// silent instead of throwing into the SSE handler.
+let audioCtx = null;
+function playTone(kind) {
+  if (!$('#soundToggle').checked) return;
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const now = audioCtx.currentTime;
+    const notes = kind === 'done' ? [660, 880] : [220, 165]; // ascending ding vs. descending buzz
+    notes.forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      const start = now + i * 0.12;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.15, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.15);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(start);
+      osc.stop(start + 0.16);
+    });
+  } catch (e) { /* autoplay blocked or no Web Audio support -- silent, not fatal */ }
+}
+
 function mergeTick(active) {
   const newActive = new Set();
   for (const partial of active) {
@@ -321,12 +356,26 @@ function mergeTick(active) {
   }
   // anything that *was* active but isn't anymore just finished/errored/was
   // deleted elsewhere -- go get its real terminal state instead of guessing.
-  let needsRefresh = false;
+  // Every id dropping out of activeIds just became terminal this tick (it's
+  // exactly the non-terminal set), which is also the right moment to check
+  // whether it's worth a sound -- once per job, not once per SSE tick.
+  const justFinished = [];
   for (const id of activeIds) {
-    if (!newActive.has(id)) needsRefresh = true;
+    if (!newActive.has(id)) justFinished.push(id);
   }
   activeIds = newActive;
-  if (needsRefresh) { loadJobs(); } else { render(); }
+  if (justFinished.length) {
+    loadJobs().then(() => {
+      for (const id of justFinished) {
+        const status = jobsById.get(id)?.status;
+        if (status === 'done') playTone('done');
+        else if (status === 'error') playTone('error');
+        // canceled: no sound -- the user did that on purpose.
+      }
+    });
+  } else {
+    render();
+  }
 }
 
 function statusLabel(j) {
@@ -553,6 +602,12 @@ $('#subFileInput').addEventListener('change', async (e) => {
 
 $('#selectAll').addEventListener('change', (e) => {
   document.querySelectorAll('.rowcheck').forEach(cb => cb.checked = e.target.checked);
+});
+
+const soundToggle = $('#soundToggle');
+soundToggle.checked = localStorage.getItem('uvm_sound') !== 'off';
+soundToggle.addEventListener('change', () => {
+  localStorage.setItem('uvm_sound', soundToggle.checked ? 'on' : 'off');
 });
 
 $('#logModalClose').addEventListener('click', () => { $('#logModal').style.display = 'none'; });
