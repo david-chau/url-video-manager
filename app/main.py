@@ -210,6 +210,18 @@ async def api_list_jobs():
     return await asyncio.to_thread(db.get_jobs)
 
 
+@app.get("/api/jobs/{job_id}")
+async def api_get_job(job_id: int):
+    """Single-job fetch with the full row, `log` included -- the SSE tick
+    deliberately strips `log` to keep the once-per-second payload small
+    (see /api/events), so this is what the UI's Log modal polls while a
+    job is still actively producing log output, not just after it's done."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return job
+
+
 @app.get("/api/jobs/{job_id}/files")
 async def api_job_files(job_id: int):
     """Every artifact on disk for this job -- the main output plus every

@@ -31,6 +31,12 @@
   .field-group .controls { margin-top: 4px; }
   .field-group label[title], button[title] { cursor: help; }
   table { width: 100%; border-collapse: collapse; background: #fff; }
+  /* Column widths below add up to ~660px -- on a narrow viewport the table
+     scrolls horizontally inside its own wrapper (min-width forces that
+     instead of every column shrinking past readability, which is what was
+     happening: the Title column had no floor at all, so it collapsed until
+     the title text wrapped one character per line). */
+  #jobsTable { min-width: 660px; }
   th, td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; font-size: 13px; vertical-align: middle; }
   th { color: #888; font-weight: 600; font-size: 12px; text-transform: uppercase; }
   tr.child td:first-of-type { padding-left: 28px; }
@@ -258,11 +264,12 @@
   </div>
 </div>
 
+<div style="overflow-x:auto">
 <table id="jobsTable">
   <thead>
     <tr>
       <th style="width:24px"><input type="checkbox" id="selectAll"></th>
-      <th>Title</th>
+      <th style="min-width:180px">Title</th>
       <th style="width:110px">Status</th>
       <th style="width:180px">Progress</th>
       <th style="width:170px">Actions</th>
@@ -270,6 +277,7 @@
   </thead>
   <tbody id="jobsBody"></tbody>
 </table>
+</div>
 
 <footer>
   <button id="deleteSelected" class="danger">Delete selected</button>
@@ -452,10 +460,13 @@ function actionsCell(j) {
     btns.push(`<button data-act="upload-sub" data-id="${j.id}" title="Got a better subtitle file from elsewhere (a subtitle site, a manual translation)? Upload it here to embed instead of what was auto-downloaded/generated.">Upload subs&hellip;</button>`);
   }
   // Full log/error text -- the progress cell only ever showed a 40-char
-  // truncated error with no way to see the rest. This reads job.log/error
-  // straight from the in-memory row (already fetched by loadJobs()), no
-  // extra request.
-  if (['done', 'error', 'canceled'].includes(j.status) && (j.log || j.error)) {
+  // truncated error with no way to see the rest. Available during active
+  // statuses too, not just terminal ones -- the OCR/Whisper stages write
+  // diagnostic lines (which language/model actually ran) while they're
+  // still running, and the modal polls for fresh content while open on an
+  // active job (see the 'log' click handler) since SSE deliberately
+  // doesn't carry `log` on every tick.
+  if (j.status !== 'queued') {
     btns.push(`<button data-act="log" data-id="${j.id}">Log</button>`);
   }
   return `<span class="row-actions">${btns.join('')}</span>`;
@@ -526,13 +537,7 @@ jobsBody.addEventListener('click', async (e) => {
       await api(`/api/jobs/${id}/regen-subs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     }
     if (act === 'log') {
-      const j = jobsById.get(Number(id));
-      $('#logModalTitle').textContent = j?.title || j?.url || `job ${id}`;
-      const parts = [];
-      if (j?.error) parts.push(`ERROR: ${j.error}`);
-      if (j?.log) parts.push(j.log);
-      $('#logModalBody').textContent = parts.join('\n\n') || '(no log)';
-      $('#logModal').style.display = 'block';
+      openLogModal(Number(id));
       return;
     }
     if (act === 'play') {
@@ -616,8 +621,47 @@ soundToggle.addEventListener('change', () => {
   localStorage.setItem('uvm_sound', soundToggle.checked ? 'on' : 'off');
 });
 
-$('#logModalClose').addEventListener('click', () => { $('#logModal').style.display = 'none'; });
-$('#logModal').addEventListener('click', (e) => { if (e.target.id === 'logModal') $('#logModal').style.display = 'none'; });
+// GET /api/jobs/{id} (not the bulk list) so this always has fresh `log`
+// content -- the SSE tick deliberately strips `log` to keep the once-per-
+// second payload small, so the in-memory jobsById copy can be stale for a
+// job that's still actively writing to its log.
+let logPollTimer = null;
+
+function renderLogModal(j, id) {
+  $('#logModalTitle').textContent = j?.title || j?.url || `job ${id}`;
+  const parts = [];
+  if (j?.error) parts.push(`ERROR: ${j.error}`);
+  if (j?.log) parts.push(j.log);
+  $('#logModalBody').textContent = parts.join('\n\n') || '(no log yet)';
+}
+
+async function openLogModal(id) {
+  $('#logModal').style.display = 'block';
+  const refresh = async () => {
+    let j;
+    try { j = await api(`/api/jobs/${id}`); } catch (e) { return null; }
+    renderLogModal(j, id);
+    return j;
+  };
+  const first = await refresh();
+  if (logPollTimer) clearInterval(logPollTimer);
+  if (first && ACTIVE_STATUSES.includes(first.status)) {
+    logPollTimer = setInterval(async () => {
+      const j = await refresh();
+      if (!j || !ACTIVE_STATUSES.includes(j.status)) {
+        clearInterval(logPollTimer);
+        logPollTimer = null;
+      }
+    }, 2000);
+  }
+}
+
+function closeLogModal() {
+  $('#logModal').style.display = 'none';
+  if (logPollTimer) { clearInterval(logPollTimer); logPollTimer = null; }
+}
+$('#logModalClose').addEventListener('click', closeLogModal);
+$('#logModal').addEventListener('click', (e) => { if (e.target.id === 'logModal') closeLogModal(); });
 $('#filesModalClose').addEventListener('click', () => { $('#filesModal').style.display = 'none'; });
 $('#filesModal').addEventListener('click', (e) => { if (e.target.id === 'filesModal') $('#filesModal').style.display = 'none'; });
 
