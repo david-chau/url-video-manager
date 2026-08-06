@@ -35,6 +35,7 @@ services:
       OCR_SAMPLE_FPS: "2"       # frames/sec sampled for hardsub OCR
       OCR_CROP_BOTTOM_PCT: "0.22"  # bottom fraction of the frame OCR'd (where hardsubs almost always sit)
       OCR_LANG: "chi_sim+chi_tra+eng"  # tesseract '+'-joined lang packs, used when a job has no gen_subs_lang hint -- chi_sim+eng alone (no chi_tra) is confirmed to garble CJK text, see worker.py's OCR_LANG comment
+      OCR_BINARIZE: "1"         # per-frame Otsu thresholding before OCR; stylized hardsubs (gradient fill + outline over moving video) are unreadable to tesseract without it. Set "0" to disable if some subtitle style reads worse with it
       TRANSLATE_MODEL_DIR: "/data/argos-models"  # argos-translate language-pair models, downloaded on first use
       YTDLP_COOKIES: "/data/cookies.txt"
       APP_PASSWORD: ""          # unset by default; set to require HTTP Basic auth on every route

@@ -594,6 +594,59 @@ def test_p7_ocr_lang_for():
     print("ok: ocr_lang_for maps zh/en, honors an explicit ocr_lang, falls back to OCR_LANG")
 
 
+def test_p7_binarize_normalizes_both_polarities():
+    """The exact failure that got the earlier fixed-threshold attempt
+    rejected: a constant that works on light-text-on-dark blanks
+    dark-text-on-light, and vice versa. Otsu + a derived polarity has to
+    survive both, from the same code path, with no tuning between them."""
+    from PIL import Image, ImageDraw
+
+    def frame(bg, fg):
+        # Text as a minority of pixels in a wide, short crop -- the shape a
+        # subtitle strip actually has.
+        img = Image.new("RGB", (320, 60), bg)
+        d = ImageDraw.Draw(img)
+        d.rectangle([40, 22, 90, 38], fill=fg)
+        d.rectangle([110, 22, 160, 38], fill=fg)
+        d.rectangle([180, 22, 230, 38], fill=fg)
+        return img
+
+    light_on_dark = worker.binarize_for_ocr(frame((20, 20, 30), (235, 235, 245)))
+    dark_on_light = worker.binarize_for_ocr(frame((240, 240, 235), (15, 15, 20)))
+
+    for name, out in (("light-on-dark", light_on_dark), ("dark-on-light", dark_on_light)):
+        hist = out.histogram()
+        black, white = hist[0], hist[255]
+        assert black + white == 320 * 60, f"{name}: output must be strictly two-valued"
+        assert black > 0 and white > 0, f"{name}: binarized to one flat colour -- text was lost"
+        # Tesseract is trained on dark text on light background; the
+        # minority class is the text, so it must end up the dark one
+        # regardless of which polarity came in.
+        assert black < white, f"{name}: text ended up light-on-dark, polarity not normalized"
+
+    # A uniform frame has no split to find. It must not raise, and it must
+    # come out flat -- which reads as "no text", the same as a blank frame.
+    flat = worker.binarize_for_ocr(Image.new("RGB", (64, 16), (90, 90, 90)))
+    fh = flat.histogram()
+    assert fh[0] + fh[255] == 64 * 16 and (fh[0] == 0 or fh[255] == 0), "uniform input must not invent text"
+    print("ok: binarize_for_ocr normalizes both hardsub polarities to dark-on-light, survives a uniform frame")
+
+
+def test_p7_otsu_threshold_splits_bimodal_histogram():
+    # Two tight peaks at 40 and 210: the split belongs strictly between
+    # them, wherever exactly Otsu lands.
+    hist = [0] * 256
+    hist[40] = 800
+    hist[210] = 200
+    t = worker.otsu_threshold(hist)
+    assert 40 <= t < 210, f"threshold {t} must separate the two modes"
+    assert worker.otsu_threshold([0] * 256) == 127, "empty histogram falls back, must not divide by zero"
+    single = [0] * 256
+    single[77] = 500
+    assert isinstance(worker.otsu_threshold(single), int), "single-mode histogram must not raise"
+    print("ok: otsu_threshold splits a bimodal histogram and survives degenerate input")
+
+
 def test_p7_append_job_log_accumulates_and_trims():
     fresh_db()
     job_id = db.insert_job(url="https://example.com/show", kind="video", status="running")

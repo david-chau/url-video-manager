@@ -92,6 +92,12 @@ OCR_CROP_BOTTOM_PCT = float(os.environ.get("OCR_CROP_BOTTOM_PCT", "0.22"))
 # together anchor it; eng can safely ride along once both are present.
 # Verified directly against a rendered test image, not assumed.
 OCR_LANG = os.environ.get("OCR_LANG", "chi_sim+chi_tra+eng")
+# Per-frame Otsu binarization before OCR (see binarize_for_ocr). On by
+# default -- stylized hardsubs are unreadable to Tesseract without it. The
+# escape hatch exists because the previous, cruder attempt at this made
+# some real input strictly worse, so a way to switch it off on the NAS
+# without waiting for a rebuild is worth one env var.
+OCR_BINARIZE = os.environ.get("OCR_BINARIZE", "1") not in ("0", "false", "False", "")
 
 # Phase 8: subtitle translation (argos-translate) runs inline in the
 # 'transcribing' stage -- no own semaphore, it's cheap text-only work
@@ -1005,6 +1011,74 @@ def ocr_lang_for(gen_subs_lang: str | None, ocr_lang: str | None = None) -> str:
     return _OCR_LANG_HINTS.get(gen_subs_lang.split("-")[0].lower(), OCR_LANG)
 
 
+def otsu_threshold(hist: list[int]) -> int:
+    """Otsu's method: the 0-255 grey level that maximizes between-class
+    variance, i.e. the split this particular histogram itself argues for.
+    Pure stdlib arithmetic over PIL's 256-bin histogram -- numpy/opencv
+    would each be a new dependency for one textbook loop.
+
+    Degenerate input (a uniform image, where every pixel lands in one bin)
+    has no meaningful split; 127 is returned and the caller's binarize step
+    turns the frame into a single flat colour, which reads as "no text
+    here" -- the same thing a blank frame already means downstream."""
+    total = sum(hist)
+    if total == 0:
+        return 127
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    w_b = 0
+    sum_b = 0
+    best_var = -1.0
+    best_t = 127
+    for t, h in enumerate(hist):
+        w_b += h
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += t * h
+        mean_b = sum_b / w_b
+        mean_f = (sum_all - sum_b) / w_f
+        var = w_b * w_f * (mean_b - mean_f) ** 2
+        if var > best_var:
+            best_var = var
+            best_t = t
+    return best_t
+
+
+def binarize_for_ocr(img):
+    """Grayscale -> per-frame Otsu -> guaranteed dark-text-on-light output.
+    Takes and returns a PIL Image (imported by the caller, not here --
+    Pillow rides in as pytesseract's dependency and stays out of this
+    module's import list).
+
+    This is the deferred half of the note above run_ocr_transcribe's frame
+    loop. A *fixed* threshold was tried and rejected there, and correctly:
+    it has to assume a polarity, and hardsub styling doesn't hold one still
+    -- the constant that rescued white-on-video text blanked blue-on-dark
+    text completely. Otsu removes the constant (each frame's own histogram
+    picks the split), and the polarity guess is removed separately below,
+    which is what makes this safe to run unconditionally where the fixed
+    version wasn't.
+
+    Polarity: subtitle glyphs are always the minority of pixels in a
+    subtitle-sized crop -- a line of text simply doesn't cover half its own
+    bounding box, whatever colour it is. So whichever class has fewer
+    pixels is the text, and the image is inverted if needed to land on the
+    dark-on-light that Tesseract is trained for. That's a property of
+    subtitles, not of a colour, which is exactly what the fixed threshold
+    lacked.
+    """
+    grey = img.convert("L")
+    t = otsu_threshold(grey.histogram())
+    bw = grey.point(lambda p: 255 if p > t else 0)
+    hist = bw.histogram()
+    # Minority class is the text; make it the dark one.
+    if hist[0] > hist[255]:
+        bw = bw.point(lambda p: 255 - p)
+    return bw
+
+
 def write_srt(cues: list[tuple[float, float, str]], path: str) -> None:
     """cues: (start_seconds, end_seconds, text). Shared by both the Whisper
     and OCR pipelines so SRT timestamp formatting (HH:MM:SS,mmm) and index
@@ -1243,8 +1317,8 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
     # useful line for diagnosing a bad OCR result after the fact (which
     # lang string and which region actually ran), visible from the UI's Log
     # button without needing docker logs at all.
-    log_line(f"[job {job_id}] ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
-    append_job_log(job_id, f"ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
+    log_line(f"[job {job_id}] ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT} binarize={OCR_BINARIZE}")
+    append_job_log(job_id, f"ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT} binarize={OCR_BINARIZE}")
     tmpdir = tempfile.mkdtemp(prefix=f"ocr-{job_id}-")
     try:
         pct = OCR_CROP_BOTTOM_PCT
@@ -1285,18 +1359,15 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             # crops (verified directly: 0.50s/frame default vs 0.41s/frame
             # with --psm 7, on the same misread-prone case).
             #
-            # A brightness/darkness threshold to isolate the text from a
-            # busy background was tried and rejected: it depends on which
-            # side (text vs. outline) is lighter, which varies by hardsub
-            # color -- a fixed threshold that fixed white-on-noisy-video
-            # text produced EMPTY output on blue-on-dark text, and the
-            # reverse polarity failed the same way in reverse. Not safe to
-            # ship without adaptive (e.g. Otsu) per-frame thresholding,
-            # which needs more validation across real subtitle styles than
-            # a couple of synthetic samples can prove.
-            # ponytail: revisit with per-frame Otsu thresholding (picks the
-            # split point from each frame's own histogram, not a fixed
-            # constant) if --psm 7 alone isn't enough in practice.
+            # Frames are binarized before OCR (binarize_for_ocr): --psm 7
+            # alone was not enough in practice -- stylized hardsubs
+            # (gradient fill, contrasting outline, decorative face) over
+            # moving video read as noise even with the right lang packs.
+            # The earlier *fixed* threshold that got rejected here is not
+            # what's running: see binarize_for_ocr for why per-frame Otsu
+            # plus a derived polarity is a different proposition.
+            # OCR_BINARIZE=0 turns it off without a rebuild if some
+            # subtitle style turns out to do worse with it.
             # --psm 7 trades away the default mode's tolerance for a
             # text-free frame: forcing "there is exactly one line here"
             # onto a crop with no real text can make Tesseract's internal
@@ -1315,9 +1386,10 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             # in several places at once -- that's the entire reason to pick
             # full-frame in the first place.
             try:
-                text = pytesseract.image_to_string(
-                    Image.open(os.path.join(tmpdir, name)), lang=lang, config=psm_config,
-                )
+                frame_img = Image.open(os.path.join(tmpdir, name))
+                if OCR_BINARIZE:
+                    frame_img = binarize_for_ocr(frame_img)
+                text = pytesseract.image_to_string(frame_img, lang=lang, config=psm_config)
             except pytesseract.TesseractError:
                 text = ""
             frame_texts.append((i * frame_interval, text))
