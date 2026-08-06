@@ -69,15 +69,36 @@ _ADD_GEN_SUBS = (
 # is clamped for kind='audio'.
 _ADD_TRANSLATE = "ALTER TABLE jobs ADD COLUMN translate_to TEXT;"
 
+# Per-job OCR tuning, both NULL = "use the container's env defaults".
+#
+# ocr_lang is a *verbatim* tesseract lang string ('chi_sim', 'chi_sim+eng',
+# ...), not a language hint to be mapped. gen_subs_lang alone turned out to
+# be too coarse for OCR: 'zh' can't distinguish simplified from traditional,
+# and the choice materially changes output -- on simplified-Chinese source,
+# including chi_tra makes tesseract emit *traditional* character forms
+# (verified: 九阳神拳吧 read as 九陽神拳吧 with chi_sim+chi_tra+eng, but
+# correctly as 九阳... with chi_sim alone). No mapping can guess that from
+# 'zh', so it's a direct user choice.
+#
+# ocr_region: 'bottom' (default, OCR_CROP_BOTTOM_PCT of the frame -- where
+# dialogue hardsubs almost always sit, and much faster) or 'full' (whole
+# frame, for videos with captions/labels elsewhere on screen, e.g. corner
+# annotations that the bottom crop misses entirely).
+_ADD_OCR_OPTS = (
+    "ALTER TABLE jobs ADD COLUMN ocr_lang TEXT;"
+    "ALTER TABLE jobs ADD COLUMN ocr_region TEXT;"
+)
+
 # Append-only: each entry is applied once, in order, tracked via
 # PRAGMA user_version. Future phases append here, never edit past entries.
-MIGRATIONS = [SCHEMA, _ADD_CONTAINER, _ADD_GEN_SUBS, _ADD_TRANSLATE]
+MIGRATIONS = [SCHEMA, _ADD_CONTAINER, _ADD_GEN_SUBS, _ADD_TRANSLATE, _ADD_OCR_OPTS]
 
 # Columns writers are allowed to touch via update_job(); keeps callers from
 # typo-ing a column name into a silent no-op.
 _JOB_COLUMNS = {
     "url", "title", "kind", "quality", "container", "subs", "embed_subs", "strip_vocals",
     "merge_subs", "sub_primary", "sub_secondary", "gen_subs", "gen_subs_lang", "translate_to",
+    "ocr_lang", "ocr_region",
     "parent_id", "child_kind",
     "status", "progress", "stage", "stage_i", "stage_n", "speed", "eta",
     "filepath", "error", "log",

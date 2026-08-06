@@ -102,6 +102,8 @@ class AddJobRequest(BaseModel):
     gen_subs: str = "off"            # Phase 7 -- off|whisper|ocr|both
     gen_subs_lang: str | None = None  # e.g. 'zh' -- hint for both engines
     translate_to: str | None = None  # Phase 8 -- e.g. 'en'; needs gen_subs_lang set
+    ocr_lang: str | None = None      # verbatim tesseract lang string; overrides the gen_subs_lang mapping
+    ocr_region: str = "bottom"       # bottom | full
 
 
 class BulkJobRequest(BaseModel):
@@ -118,6 +120,8 @@ class BulkJobRequest(BaseModel):
     gen_subs: str = "off"
     gen_subs_lang: str | None = None
     translate_to: str | None = None
+    ocr_lang: str | None = None
+    ocr_region: str = "bottom"
     force: bool = False
 
 
@@ -137,6 +141,8 @@ class RegenSubsRequest(BaseModel):
     gen_subs: str | None = None
     gen_subs_lang: str | None = None
     translate_to: str | None = None
+    ocr_lang: str | None = None
+    ocr_region: str | None = None
 
 
 # ------------------------------------------------------------- helpers
@@ -167,7 +173,8 @@ def _create_job(
     strip_vocals: bool = False, merge_subs: bool = False,
     sub_primary: str | None = None, sub_secondary: str | None = None,
     container: str = "mp4", gen_subs: str = "off", gen_subs_lang: str | None = None,
-    translate_to: str | None = None,
+    translate_to: str | None = None, ocr_lang: str | None = None,
+    ocr_region: str = "bottom",
 ) -> dict:
     """Playlist classification is explicit, done at insert time -- not
     guessed at download time. Phase 1's noplaylist=True stays on every
@@ -183,11 +190,14 @@ def _create_job(
     if container not in worker.CONTAINER_CHOICES:
         container = "mp4"
     gen_subs, translate_to = _clamp_gen_subs(kind, gen_subs, gen_subs_lang, translate_to)
+    if ocr_region not in worker.OCR_REGIONS:
+        ocr_region = "bottom"
+    ocr_lang = (ocr_lang or "").strip() or None
     common = dict(
         subs=subs, embed_subs=int(embed_subs), strip_vocals=int(strip_vocals),
         merge_subs=int(bool(merge_subs)), sub_primary=sub_primary, sub_secondary=sub_secondary,
         container=container, gen_subs=gen_subs, gen_subs_lang=gen_subs_lang,
-        translate_to=translate_to,
+        translate_to=translate_to, ocr_lang=ocr_lang, ocr_region=ocr_region,
     )
     if cls == "playlist":
         job_id = db.insert_job(
@@ -287,12 +297,18 @@ async def api_regen_subs(job_id: int, req: RegenSubsRequest):
     gen_subs = req.gen_subs if req.gen_subs is not None else (job.get("gen_subs") or "off")
     gen_subs_lang = req.gen_subs_lang if req.gen_subs_lang is not None else job.get("gen_subs_lang")
     translate_to = req.translate_to if req.translate_to is not None else job.get("translate_to")
+    ocr_lang = req.ocr_lang if req.ocr_lang is not None else job.get("ocr_lang")
+    ocr_region = req.ocr_region if req.ocr_region is not None else job.get("ocr_region")
+    if ocr_region not in worker.OCR_REGIONS:
+        ocr_region = "bottom"
+    ocr_lang = (ocr_lang or "").strip() or None
     gen_subs, translate_to = _clamp_gen_subs(job["kind"], gen_subs, gen_subs_lang, translate_to)
     if gen_subs == "off":
         raise HTTPException(400, "nothing to generate -- set gen_subs to whisper/ocr/both first")
 
     await asyncio.to_thread(
         db.update_job, job_id, gen_subs=gen_subs, gen_subs_lang=gen_subs_lang, translate_to=translate_to,
+        ocr_lang=ocr_lang, ocr_region=ocr_region,
         status="transcribing", progress=0, error=None, stage=None,
     )
     updated_job = await asyncio.to_thread(db.get_job, job_id)
@@ -307,7 +323,7 @@ async def api_add_job(req: AddJobRequest):
     return await asyncio.to_thread(
         _create_job, req.url.strip(), req.kind, req.quality, req.subs, req.embed_subs,
         req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
-        req.gen_subs, req.gen_subs_lang, req.translate_to,
+        req.gen_subs, req.gen_subs_lang, req.translate_to, req.ocr_lang, req.ocr_region,
     )
 
 
@@ -320,7 +336,7 @@ async def api_bulk_add(req: BulkJobRequest):
         job = await asyncio.to_thread(
             _create_job, url, req.kind, req.quality, req.subs, req.embed_subs,
             req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
-            req.gen_subs, req.gen_subs_lang, req.translate_to,
+            req.gen_subs, req.gen_subs_lang, req.translate_to, req.ocr_lang, req.ocr_region,
         )
         added.append(job)
     return {"added": added, "duplicates": dupes}

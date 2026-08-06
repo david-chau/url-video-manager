@@ -966,11 +966,23 @@ def decode_srt_bytes(raw: bytes) -> str:
 _OCR_LANG_HINTS = {"zh": "chi_sim+chi_tra+eng", "en": "eng"}
 
 
-def ocr_lang_for(gen_subs_lang: str | None) -> str:
-    """Small, deliberately partial mapping from a job's language hint to a
-    Tesseract '+'-joined lang string -- not a general-purpose table for
-    every possible language, just the realistic cases. Falls back to
-    OCR_LANG for anything else."""
+OCR_REGIONS = ("bottom", "full")
+
+
+def ocr_lang_for(gen_subs_lang: str | None, ocr_lang: str | None = None) -> str:
+    """Resolves the Tesseract '+'-joined lang string for a job.
+
+    An explicit per-job ocr_lang wins outright and is used verbatim -- the
+    gen_subs_lang mapping below can't express the distinction that matters
+    most in practice: 'zh' says nothing about simplified vs. traditional,
+    and including chi_tra makes tesseract render simplified source text in
+    *traditional* forms (九阳 -> 九陽). Only the user knows which their
+    video is, so when they say, we don't second-guess it.
+
+    Falling back: the gen_subs_lang hint through _OCR_LANG_HINTS, then the
+    OCR_LANG env default."""
+    if ocr_lang and ocr_lang.strip():
+        return ocr_lang.strip()
     if not gen_subs_lang:
         return OCR_LANG
     return _OCR_LANG_HINTS.get(gen_subs_lang.split("-")[0].lower(), OCR_LANG)
@@ -1208,19 +1220,25 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
     from PIL import Image  # Pillow: pytesseract's own dependency, not ours
 
     fps = OCR_SAMPLE_FPS
-    lang = ocr_lang_for(job.get("gen_subs_lang"))
+    lang = ocr_lang_for(job.get("gen_subs_lang"), job.get("ocr_lang"))
+    region = job.get("ocr_region") or "bottom"
     # Recorded both to stdout and the job's own DB log -- the single most
-    # useful line for diagnosing a bad OCR result after the fact (was this
-    # run actually using the fixed chi_sim+chi_tra+eng, or a stale image/
-    # compose file's old chi_sim+eng?), visible from the UI's Log button
-    # without needing docker logs at all.
-    log_line(f"[job {job_id}] ocr: lang={lang!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
+    # useful line for diagnosing a bad OCR result after the fact (which
+    # lang string and which region actually ran), visible from the UI's Log
+    # button without needing docker logs at all.
+    log_line(f"[job {job_id}] ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT}")
     prior_log = job.get("log") or ""
-    db.update_job(job_id, log=(prior_log + f"\n[{_timestamp()}] ocr: lang={lang!r} sample_fps={fps}")[-8192:])
+    db.update_job(job_id, log=(prior_log + f"\n[{_timestamp()}] ocr: lang={lang!r} region={region!r} sample_fps={fps}")[-8192:])
     tmpdir = tempfile.mkdtemp(prefix=f"ocr-{job_id}-")
     try:
         pct = OCR_CROP_BOTTOM_PCT
-        vf = f"fps={fps},crop=iw:ih*{pct}:0:ih*(1-{pct})"
+        # 'full' OCRs the whole frame -- slower (more pixels per frame, and
+        # --psm 7's single-line assumption is a worse fit), but the bottom
+        # crop misses text placed anywhere else, e.g. corner labels or
+        # captions positioned mid-frame, which read as "hardsubs silently
+        # not decoded" rather than as an error.
+        vf = f"fps={fps}" if region == "full" else f"fps={fps},crop=iw:ih*{pct}:0:ih*(1-{pct})"
+        psm_config = "--psm 11" if region == "full" else "--psm 7"
         cmd = ["ffmpeg", "-y", "-i", video_src, "-vf", vf, "-q:v", "2", os.path.join(tmpdir, "%06d.png")]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         _thread_proc[threading.get_ident()] = proc
@@ -1274,9 +1292,15 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             # this frame has no recognizable text, exactly what a blank
             # result already means to ocr_frames_to_cues, so treat it the
             # same rather than letting it kill the whole job.
+            #
+            # region='full' overrides all of the above to --psm 11 (sparse
+            # text, no layout assumption): "exactly one line" is simply
+            # wrong for a whole frame, which is the case where text can be
+            # in several places at once -- that's the entire reason to pick
+            # full-frame in the first place.
             try:
                 text = pytesseract.image_to_string(
-                    Image.open(os.path.join(tmpdir, name)), lang=lang, config="--psm 7",
+                    Image.open(os.path.join(tmpdir, name)), lang=lang, config=psm_config,
                 )
             except pytesseract.TesseractError:
                 text = ""

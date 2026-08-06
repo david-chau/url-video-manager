@@ -583,7 +583,15 @@ def test_p7_ocr_lang_for():
     assert worker.ocr_lang_for("zh-Hans") == "chi_sim+chi_tra+eng"
     assert worker.ocr_lang_for("en") == "eng"
     assert worker.ocr_lang_for("fr") == worker.OCR_LANG  # unmapped -> fall back to default
-    print("ok: ocr_lang_for maps zh/en, falls back to OCR_LANG for everything else")
+
+    # An explicit per-job ocr_lang beats the hint outright, including the
+    # case the whole option exists for: 'zh' + chi_sim, where the mapping
+    # would otherwise add chi_tra and emit traditional forms for
+    # simplified source.
+    assert worker.ocr_lang_for("zh", "chi_sim") == "chi_sim"
+    assert worker.ocr_lang_for(None, " eng ") == "eng"
+    assert worker.ocr_lang_for("zh", "") == "chi_sim+chi_tra+eng"  # blank = not set
+    print("ok: ocr_lang_for maps zh/en, honors an explicit ocr_lang, falls back to OCR_LANG")
 
 
 def test_p7_missing_whisper_fails_fast():

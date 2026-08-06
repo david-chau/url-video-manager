@@ -241,6 +241,27 @@
         <input type="text" id="translateTo" placeholder="en" size="4" disabled>
       </label>
     </div>
+    <div class="controls" id="ocrOptionsRow">
+      <label title="Which Tesseract language pack(s) OCR uses. This matters more than it looks: including chi_tra on simplified-Chinese source makes Tesseract output TRADITIONAL character forms (九阳 comes back as 九陽). Pick the one that matches your video -- 'auto' derives it from the lang hint, which can't tell simplified from traditional.">ocr lang:
+        <select id="ocrLang">
+          <option value="" selected>auto (from lang hint)</option>
+          <option value="chi_sim">chi_sim (simplified only)</option>
+          <option value="chi_sim+eng">chi_sim+eng</option>
+          <option value="chi_tra">chi_tra (traditional only)</option>
+          <option value="chi_tra+eng">chi_tra+eng</option>
+          <option value="chi_sim+chi_tra+eng">chi_sim+chi_tra+eng</option>
+          <option value="eng">eng</option>
+          <option value="jpn">jpn</option>
+          <option value="kor">kor</option>
+        </select>
+      </label>
+      <label title="bottom: only OCR the bottom slice of each frame, where dialogue subtitles almost always sit -- faster and less noise. full: OCR the whole frame, for videos with text elsewhere on screen (corner labels, mid-frame captions) that the bottom crop misses entirely. Slower.">ocr region:
+        <select id="ocrRegion">
+          <option value="bottom" selected>bottom (subtitles)</option>
+          <option value="full">full frame (slower)</option>
+        </select>
+      </label>
+    </div>
   </div>
 
   <div class="field-group" id="audioOptionsGroup">
@@ -294,6 +315,56 @@
       <video id="playerVideo" controls style="width:100%; max-height:70vh; background:#000"></video>
     </div>
     <p class="hint" style="margin:6px 0 0">Use the player's CC/subtitles button to pick a track. (Audio-only files play here too -- &lt;audio&gt; elements don't support a caption picker in most browsers, &lt;video&gt; does even with no picture.)</p>
+  </div>
+</div>
+
+<div id="regenModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10">
+  <div class="modal-box" style="max-width:480px; margin:8vh auto; padding:16px; border-radius:8px">
+    <div class="controls" style="margin-top:0">
+      <strong id="regenModalTitle" style="font-size:14px">Regenerate subtitles</strong>
+      <span class="spacer"></span>
+      <button id="regenModalClose" type="button">Cancel</button>
+    </div>
+    <p class="hint" style="margin:8px 0 0">Re-runs against the file already on disk &mdash; no re-download.</p>
+    <div class="controls">
+      <label>engine:
+        <select id="regenGenSubs">
+          <option value="whisper">whisper</option>
+          <option value="ocr">ocr</option>
+          <option value="both">both</option>
+        </select>
+      </label>
+      <label>lang hint: <input type="text" id="regenGenSubsLang" placeholder="zh" size="4"></label>
+    </div>
+    <div class="controls" id="regenOcrRow">
+      <label>ocr lang:
+        <select id="regenOcrLang">
+          <option value="">auto (from lang hint)</option>
+          <option value="chi_sim">chi_sim (simplified only)</option>
+          <option value="chi_sim+eng">chi_sim+eng</option>
+          <option value="chi_tra">chi_tra (traditional only)</option>
+          <option value="chi_tra+eng">chi_tra+eng</option>
+          <option value="chi_sim+chi_tra+eng">chi_sim+chi_tra+eng</option>
+          <option value="eng">eng</option>
+          <option value="jpn">jpn</option>
+          <option value="kor">kor</option>
+        </select>
+      </label>
+      <label>ocr region:
+        <select id="regenOcrRegion">
+          <option value="bottom">bottom (subtitles)</option>
+          <option value="full">full frame (slower)</option>
+        </select>
+      </label>
+    </div>
+    <div class="controls">
+      <label>translate to: <input type="text" id="regenTranslateTo" placeholder="en" size="4"></label>
+      <span class="spacer"></span>
+      <button id="regenModalRun" class="primary" type="button">Regenerate</button>
+    </div>
+    <p class="hint" id="regenVideoWarning" style="margin:8px 0 0; display:none">
+      Note: for video jobs this <strong>adds</strong> another subtitle track rather than replacing the old one &mdash; pick the right one in your player, or delete + re-add for a single-track file.
+    </p>
   </div>
 </div>
 
@@ -566,13 +637,8 @@ jobsBody.addEventListener('click', async (e) => {
       return; // upload itself happens in the file input's change handler
     }
     if (act === 'regen-subs') {
-      const j = jobsById.get(Number(id));
-      const isVideo = j?.kind === 'video';
-      const warn = isVideo
-        ? ' Note: for video jobs this adds another subtitle track rather than replacing the old one -- pick the right one in your player, or delete + re-add for a single-track file.'
-        : '';
-      if (!confirm(`Re-run subtitle generation (${j?.gen_subs || 'current settings'}) using the file already on disk -- no re-download.${warn}`)) return;
-      await api(`/api/jobs/${id}/regen-subs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      openRegenModal(Number(id));
+      return; // the modal's Regenerate button does the POST
     }
     if (act === 'log') {
       openLogModal(Number(id));
@@ -714,6 +780,70 @@ function closePlayer() {
 $('#playerModalClose').addEventListener('click', closePlayer);
 $('#playerModal').addEventListener('click', (e) => { if (e.target.id === 'playerModal') closePlayer(); });
 
+// Regen-subs is a modal rather than the old confirm(): re-running with the
+// *same* settings that already produced a bad transcript is the one thing
+// nobody wants, and ocr_lang in particular (chi_sim vs. chi_sim+chi_tra)
+// is the usual reason a run gets repeated at all.
+let regenJobId = null;
+
+function updateRegenModalState() {
+  const engine = $('#regenGenSubs').value;
+  $('#regenOcrRow').style.display = (engine === 'ocr' || engine === 'both') ? '' : 'none';
+}
+$('#regenGenSubs').addEventListener('change', updateRegenModalState);
+
+function openRegenModal(id) {
+  const j = jobsById.get(id);
+  regenJobId = id;
+  const isAudio = j?.kind === 'audio';
+  // Same clamp as the add form and main.py's _clamp_gen_subs -- no frames
+  // on an audio-only job, so ocr/both can't run against one.
+  for (const opt of $('#regenGenSubs').options) {
+    opt.disabled = isAudio && (opt.value === 'ocr' || opt.value === 'both');
+  }
+  let engine = j?.gen_subs && j.gen_subs !== 'off' ? j.gen_subs : 'whisper';
+  if (isAudio && (engine === 'ocr' || engine === 'both')) engine = 'whisper';
+  $('#regenGenSubs').value = engine;
+  $('#regenGenSubsLang').value = j?.gen_subs_lang || '';
+  $('#regenOcrLang').value = j?.ocr_lang || '';
+  $('#regenOcrRegion').value = j?.ocr_region || 'bottom';
+  $('#regenTranslateTo').value = j?.translate_to || '';
+  $('#regenModalTitle').textContent = `Regenerate subtitles -- ${j?.title || j?.url || `job ${id}`}`;
+  $('#regenVideoWarning').style.display = isAudio ? 'none' : '';
+  updateRegenModalState();
+  $('#regenModal').style.display = 'block';
+}
+
+function closeRegenModal() {
+  $('#regenModal').style.display = 'none';
+  regenJobId = null;
+}
+$('#regenModalClose').addEventListener('click', closeRegenModal);
+$('#regenModal').addEventListener('click', (e) => { if (e.target.id === 'regenModal') closeRegenModal(); });
+
+$('#regenModalRun').addEventListener('click', async () => {
+  const id = regenJobId;
+  if (id == null) return;
+  // '' rather than null on every field: api_regen_subs treats null as
+  // "keep whatever the job already has", so null would make clearing a
+  // field (e.g. dropping a wrong lang hint) impossible. Empty string is
+  // normalized back to None server-side.
+  const body = {
+    gen_subs: $('#regenGenSubs').value,
+    gen_subs_lang: $('#regenGenSubsLang').value.trim(),
+    translate_to: $('#regenTranslateTo').value.trim(),
+    ocr_lang: $('#regenOcrLang').value,
+    ocr_region: $('#regenOcrRegion').value,
+  };
+  closeRegenModal();
+  try {
+    await api(`/api/jobs/${id}/regen-subs`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+  } catch (err) { alert(err.message); }
+  loadJobs();
+});
+
 $('#deleteSelected').addEventListener('click', async () => {
   const ids = [...document.querySelectorAll('.rowcheck:checked')].map(cb => Number(cb.dataset.id));
   if (!ids.length) return;
@@ -768,6 +898,10 @@ function updateFormState() {
   translateToEl.disabled = !canTranslate;
   if (!canTranslate) translateToEl.value = '';
 
+  // OCR-only knobs; nothing to tune when the OCR engine isn't running.
+  const usesOcr = genSubsEl.value === 'ocr' || genSubsEl.value === 'both';
+  $('#ocrOptionsRow').style.display = usesOcr ? '' : 'none';
+
   const langs = subLangs();
   const canMerge = langs.length >= 2;
   const mergeEl = $('#mergeSubs');
@@ -802,6 +936,8 @@ function formValues() {
     gen_subs: $('#genSubs').value,
     gen_subs_lang: $('#genSubsLang').value.trim() || null,
     translate_to: $('#translateTo').value.trim() || null,
+    ocr_lang: $('#ocrLang').value || null,
+    ocr_region: $('#ocrRegion').value,
   };
 }
 
