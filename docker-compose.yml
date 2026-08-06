@@ -37,6 +37,7 @@ services:
       OCR_LANG: "chi_sim+chi_tra+eng"  # tesseract '+'-joined lang packs, used when a job has no gen_subs_lang hint -- chi_sim+eng alone (no chi_tra) is confirmed to garble CJK text, see worker.py's OCR_LANG comment
       OCR_BINARIZE: "1"         # per-frame Otsu thresholding before OCR; stylized hardsubs (gradient fill + outline over moving video) are unreadable to tesseract without it. Set "0" to disable if some subtitle style reads worse with it
       TRANSLATE_MODEL_DIR: "/data/argos-models"  # argos-translate language-pair models, downloaded on first use
+      WHISPER_MODEL_DIR: "/data/whisper-models"  # faster-whisper model (~500MB for 'small'), downloaded on first use. Must live on /data: the default cache is under $HOME, which is '/' when `user:` below is set, and a non-root container can't write there
       YTDLP_COOKIES: "/data/cookies.txt"
       APP_PASSWORD: ""          # unset by default; set to require HTTP Basic auth on every route
     # On Synology, uncomment and set to your `id <you>` uid:gid (usually the

@@ -112,6 +112,17 @@ OCR_BINARIZE = os.environ.get("OCR_BINARIZE", "1") not in ("0", "false", "False"
 TRANSLATE_MODEL_DIR = os.environ.get("TRANSLATE_MODEL_DIR", "/data/argos-models")
 os.environ.setdefault("ARGOS_PACKAGES_DIR", TRANSLATE_MODEL_DIR)
 
+# Same treatment for faster-whisper, and for the same two reasons. Its model
+# (~500MB for 'small') downloads from the HF hub on first use, and without
+# this it lands in huggingface_hub's default cache under $HOME -- which is
+# '/' when the container runs as a non-root user via compose's `user:`, so
+# the download dies with PermissionError: '/.cache' before the model is ever
+# loaded. HF_HOME covers the hub's own bookkeeping files, download_root (see
+# run_whisper_transcribe) covers the model itself; both are needed, and both
+# belong on /data so the download survives a container restart.
+WHISPER_MODEL_DIR = os.environ.get("WHISPER_MODEL_DIR", "/data/whisper-models")
+os.environ.setdefault("HF_HOME", WHISPER_MODEL_DIR)
+
 # Job ids the user has asked to cancel. Checked on every progress_hook fire.
 CANCELED: set[int] = set()
 
@@ -1245,7 +1256,13 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
             if job_id in CANCELED:
                 return {"status": "canceled", "error": "canceled by user"}
 
-        model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        # download_root: see WHISPER_MODEL_DIR above. Created here rather
+        # than assumed -- /data is a mounted volume, and the first whisper
+        # job on a fresh install is exactly when it won't exist yet.
+        os.makedirs(WHISPER_MODEL_DIR, exist_ok=True)
+        model = WhisperModel(
+            WHISPER_MODEL, device="cpu", compute_type="int8", download_root=WHISPER_MODEL_DIR,
+        )
         segments, info = model.transcribe(audio_src, language=job.get("gen_subs_lang") or None)
         total = info.duration or 0
         # Same reasoning as run_ocr_transcribe's log line -- which model and
@@ -1281,6 +1298,17 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         return {"status": "done", "path": out_srt}
     except subprocess.CalledProcessError as e:
         msg = f"ffmpeg audio extraction failed: {e}"
+        log_line(f"[job {job_id}] ERROR: {msg}")
+        return {"status": "error", "error": msg}
+    except Exception as e:
+        # Model load/download is the realistic failure here and it raises
+        # anything but CalledProcessError -- PermissionError when the HF
+        # cache isn't writable, OSError/network errors on the ~500MB first
+        # fetch, RuntimeError from ctranslate2 on an unsupported CPU. This
+        # function's contract is an error dict, so honour it for all of
+        # them: an escaping exception becomes a job that sits in
+        # 'transcribing' forever with nothing shown to the user.
+        msg = f"whisper failed: {type(e).__name__}: {e}"
         log_line(f"[job {job_id}] ERROR: {msg}")
         return {"status": "error", "error": msg}
     finally:
@@ -1684,6 +1712,26 @@ async def _run_subs_and_mux_stage(
     await asyncio.to_thread(append_job_log, job_id, "stage: done (nothing to mux)")
 
 
+def fail_job(job_id: int, e: BaseException) -> None:
+    """Terminal failure path for an unexpected exception in a background
+    job task: get it onto the row, and onto the job's own log, so it
+    reaches the UI instead of only `docker logs`.
+
+    These coroutines are launched with a bare asyncio.create_task and
+    nobody awaits the result, so an escaping exception surfaces as
+    "Task exception was never retrieved" on stderr and NOTHING else -- the
+    row keeps whatever active status it had and the job appears frozen in
+    the table forever. _dispatch has always done this for queued jobs; the
+    resume paths are the gap this closes."""
+    msg = f"{type(e).__name__}: {e}"
+    log_line(f"[job {job_id}] ERROR: {msg}")
+    try:
+        db.update_job(job_id, status="error", error=msg)
+        append_job_log(job_id, f"ERROR: {msg}")
+    except Exception:  # noqa: BLE001 -- a DB write failing here must not mask the original error
+        log_line(f"[job {job_id}] ERROR: additionally failed to record the error above")
+
+
 async def resume_separation(job: dict) -> None:
     """Startup recovery for a 'separating' row whose source file still
     exists on disk: demucs isn't resumable mid-run, so this restarts step 2
@@ -1694,17 +1742,20 @@ async def resume_separation(job: dict) -> None:
     # here skips rollup-caption dedup rather than guessing at it. Delete
     # and retry from scratch if that matters for a given job.
     """
-    orig_filepath = job["filepath"]
-    orig_base = os.path.splitext(orig_filepath)[0]
-    current_filepath = await _run_separation_stage(job, orig_filepath)
-    if current_filepath is None:
-        return
-    generated_tracks = None
-    if job.get("gen_subs") and job["gen_subs"] not in (None, "off"):
-        generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
-        if generated_tracks is None:
+    try:
+        orig_filepath = job["filepath"]
+        orig_base = os.path.splitext(orig_filepath)[0]
+        current_filepath = await _run_separation_stage(job, orig_filepath)
+        if current_filepath is None:
             return
-    await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
+        generated_tracks = None
+        if job.get("gen_subs") and job["gen_subs"] not in (None, "off"):
+            generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
+            if generated_tracks is None:
+                return
+        await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
+    except Exception as e:
+        fail_job(job["id"], e)
 
 
 async def resume_transcribe(job: dict) -> None:
@@ -1721,12 +1772,15 @@ async def resume_transcribe(job: dict) -> None:
     # same as resume_separation -- a resumed merge_subs job skips rollup
     # dedup, see that docstring for why.
     """
-    orig_base = resolve_orig_base(job)
-    current_filepath = job["filepath"]
-    generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
-    if generated_tracks is None:
-        return
-    await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
+    try:
+        orig_base = resolve_orig_base(job)
+        current_filepath = job["filepath"]
+        generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
+        if generated_tracks is None:
+            return
+        await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
+    except Exception as e:
+        fail_job(job["id"], e)
 
 
 # -------------------------------------------------------------- queue loop
@@ -1739,8 +1793,7 @@ async def _dispatch(job: dict) -> None:
         else:
             await _process_job(job)
     except Exception as e:  # never let one bad job kill the loop
-        log_line(f"[job {job['id']}] ERROR: {type(e).__name__}: {e}")
-        db.update_job(job["id"], status="error", error=f"{type(e).__name__}: {e}")
+        fail_job(job["id"], e)
 
 
 async def _process_job(job: dict) -> None:
@@ -1773,8 +1826,7 @@ async def _continue_after_download(job: dict, info: dict | None) -> None:
                 return  # error/canceled already written by _run_transcribe_stage
         await _run_subs_and_mux_stage(job, orig_base, current_filepath, info, generated_tracks)
     except Exception as e:
-        log_line(f"[job {job_id}] ERROR: {type(e).__name__}: {e}")
-        db.update_job(job_id, status="error", error=f"{type(e).__name__}: {e}")
+        fail_job(job_id, e)
 
 
 async def queue_loop(stop_event: asyncio.Event) -> None:

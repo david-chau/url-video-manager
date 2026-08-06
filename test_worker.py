@@ -674,6 +674,36 @@ def test_p7_append_job_log_accumulates_and_trims():
     print("ok: append_job_log accumulates across stages, re-reads the row, trims to the last 8KB")
 
 
+def test_p7_resume_crash_marks_job_errored():
+    """A crash in a resume task used to reach stderr only ("Task exception
+    was never retrieved") -- the row kept its active status and the job
+    looked frozen in the UI forever. Any exception must land on the row."""
+    fresh_db()
+    src = os.path.join(os.environ["DOWNLOADS_DIR"], "show.mp4")
+    open(src, "wb").close()
+    job_id = db.insert_job(url="https://example.com/show", kind="video", status="transcribing")
+    db.update_job(job_id, filepath=src, gen_subs="whisper")
+    job = db.get_job(job_id)
+
+    def explode(*_a, **_kw):
+        # The real one from the NAS: non-root container, HF cache under a
+        # $HOME it can't write, raised while loading the whisper model.
+        raise PermissionError(13, "Permission denied: '/.cache'")
+
+    orig = worker.run_transcribe
+    worker.run_transcribe = explode
+    try:
+        asyncio.run(worker.resume_transcribe(job))
+    finally:
+        worker.run_transcribe = orig
+
+    row = db.get_job(job_id)
+    assert row["status"] == "error", f"crashed job must not stay {row['status']!r}"
+    assert "PermissionError" in (row["error"] or ""), "the error column must name what actually failed"
+    assert "PermissionError" in (row["log"] or ""), "and it must reach the job log the UI shows"
+    print("ok: an exception in a resume task marks the job errored instead of freezing it")
+
+
 def test_p7_missing_whisper_fails_fast():
     fresh_db()
     job_id = db.insert_job(url="https://example.com/show", kind="video", status="transcribing")
