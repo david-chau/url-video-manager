@@ -41,18 +41,30 @@ def log_line(msg: str) -> None:
     print(f"[{_timestamp()}] {msg}", flush=True)
 
 
-def append_job_log(job_id: int, msg: str) -> None:
+def append_job_log(job_id: int, msg: str, echo: bool = True) -> None:
     """Timestamped append to a job's own `log` column -- what the UI's Log
-    button shows. Re-reads the row rather than taking a `prior_log` from
-    the caller's job dict: a job dict is a snapshot from whenever the stage
-    started, so appending onto it silently drops every line written since
-    (which is exactly what the pipeline does -- each stage holds its own
-    copy). Trimmed to the last 8KB; the tail is what matters.
+    button shows -- mirrored to stdout so `docker logs` shows the same
+    story. Both, by default, deliberately: when these lines went only to
+    the DB, a whisper run that started, produced 129 cues and muxed
+    cleanly was completely invisible to `docker logs`, which showed the
+    engine starting and then nothing forever. Every diagnosis from the
+    outside then chases a job that already finished.
+
+    echo=False is for text already on stdout by another route (a
+    JobLogger dump, or fail_job's own log_line), to avoid printing twice.
+
+    Re-reads the row rather than taking a `prior_log` from the caller's
+    job dict: a job dict is a snapshot from whenever the stage started, so
+    appending onto it silently drops every line written since (which is
+    exactly what the pipeline does -- each stage holds its own copy).
+    Trimmed to the last 8KB; the tail is what matters.
     # ponytail: read-modify-write, no locking. Stages within one job run
     # strictly in sequence, so the only racer would be two stages of the
     # SAME job at once, which the pipeline never does. Revisit if that
     # ever stops being true.
     """
+    if echo:
+        log_line(f"[job {job_id}] {msg}")
     prior = (db.get_job(job_id) or {}).get("log") or ""
     db.update_job(job_id, log=(prior + f"\n[{_timestamp()}] {msg}")[-8192:])
 
@@ -98,6 +110,11 @@ OCR_LANG = os.environ.get("OCR_LANG", "chi_sim+chi_tra+eng")
 # some real input strictly worse, so a way to switch it off on the NAS
 # without waiting for a rebuild is worth one env var.
 OCR_BINARIZE = os.environ.get("OCR_BINARIZE", "1") not in ("0", "false", "False", "")
+
+# Seconds between stdout liveness lines inside the long transcribe loops.
+# 30s is sparse enough not to bury `docker logs` on a multi-hour OCR run,
+# frequent enough that "still working" is obvious without waiting.
+HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", "30"))
 
 # Phase 8: subtitle translation (argos-translate) runs inline in the
 # 'transcribing' stage -- no own semaphore, it's cheap text-only work
@@ -1272,11 +1289,11 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         # is a diagnostic line, not worth risking an unhandled AttributeError
         # over if a future faster-whisper version renames the field.
         detected_lang = getattr(info, "language", "?")
-        log_line(f"[job {job_id}] whisper: model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
         append_job_log(job_id, f"whisper: model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
 
         cues = []
         last_flush = 0.0
+        last_beat = time.monotonic()
         for seg in segments:
             if job_id in CANCELED:
                 return {"status": "canceled", "error": "canceled by user"}
@@ -1288,6 +1305,15 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
                 pct = min(100.0, seg.end / total * 100.0) if total else 0.0
                 db.update_job(job_id, progress=round(pct, 1), stage="transcribing (whisper)")
                 last_flush = now
+            # Heartbeat to stdout. The DB progress above already drives the
+            # UI bar, but from `docker logs` a multi-minute transcribe was
+            # indistinguishable from a hang -- which is exactly the wrong
+            # guess to invite, since the fix for one is "wait" and for the
+            # other "restart". Sparse on purpose: this is a liveness
+            # signal, not a progress bar.
+            if now - last_beat >= HEARTBEAT_SECONDS:
+                log_line(f"[job {job_id}] whisper: {seg.end:.0f}s/{total:.0f}s transcribed, {len(cues)} cues so far")
+                last_beat = now
 
         if not cues:
             msg = "whisper produced no cues (silent audio, or an unsupported/mismatched language hint)"
@@ -1345,7 +1371,6 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
     # useful line for diagnosing a bad OCR result after the fact (which
     # lang string and which region actually ran), visible from the UI's Log
     # button without needing docker logs at all.
-    log_line(f"[job {job_id}] ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT} binarize={OCR_BINARIZE}")
     append_job_log(job_id, f"ocr: lang={lang!r} region={region!r} sample_fps={fps} crop_bottom_pct={OCR_CROP_BOTTOM_PCT} binarize={OCR_BINARIZE}")
     tmpdir = tempfile.mkdtemp(prefix=f"ocr-{job_id}-")
     try:
@@ -1377,6 +1402,7 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
         frame_interval = 1.0 / fps
         frame_texts = []
         last_flush = 0.0
+        last_beat = time.monotonic()
         for i, name in enumerate(frames):
             if job_id in CANCELED:
                 return {"status": "canceled", "error": "canceled by user"}
@@ -1425,6 +1451,11 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             if now - last_flush >= 1.0:
                 db.update_job(job_id, progress=round((i + 1) / len(frames) * 100.0, 1), stage="transcribing (ocr)")
                 last_flush = now
+            # Liveness on stdout, same reasoning as the whisper loop above.
+            if now - last_beat >= HEARTBEAT_SECONDS:
+                blank_so_far = sum(1 for _t, txt in frame_texts if not txt.strip())
+                log_line(f"[job {job_id}] ocr: frame {i + 1}/{len(frames)}, {blank_so_far} blank so far")
+                last_beat = now
 
         cues = ocr_frames_to_cues(frame_texts, frame_interval)
         if not cues:
@@ -1676,7 +1707,7 @@ async def _run_subs_and_mux_stage(
         logger = JobLogger(job_id)
         merged_srt = await asyncio.to_thread(merge_bilingual_subs, job, orig_base, info, logger)
         if logger.lines:
-            await asyncio.to_thread(append_job_log, job_id, logger.dump())
+            await asyncio.to_thread(append_job_log, job_id, logger.dump(), False)
 
     if job["kind"] == "audio":
         sub_tracks = []
@@ -1727,7 +1758,7 @@ def fail_job(job_id: int, e: BaseException) -> None:
     log_line(f"[job {job_id}] ERROR: {msg}")
     try:
         db.update_job(job_id, status="error", error=msg)
-        append_job_log(job_id, f"ERROR: {msg}")
+        append_job_log(job_id, f"ERROR: {msg}", echo=False)
     except Exception:  # noqa: BLE001 -- a DB write failing here must not mask the original error
         log_line(f"[job {job_id}] ERROR: additionally failed to record the error above")
 
