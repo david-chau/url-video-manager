@@ -752,6 +752,51 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p8_english_target_uses_whisper_translate():
+    """Whisper's own translate task beats transcribe-then-argos for English:
+    it translates from the audio, not from a transcript that already threw
+    that context away. Non-English targets it can't produce must still go
+    through argos."""
+    assert worker.is_whisper_translatable("en")
+    assert worker.is_whisper_translatable("EN")
+    assert worker.is_whisper_translatable("en-US"), "regional English must not fall back to the weaker engine"
+    assert not worker.is_whisper_translatable("pt")
+    assert not worker.is_whisper_translatable("")
+    assert not worker.is_whisper_translatable(None)
+
+    fresh_db()
+    downloads = os.environ["DOWNLOADS_DIR"]
+    video = os.path.join(downloads, "ep.mp4")
+    open(video, "wb").close()
+    orig_base = os.path.join(downloads, "ep")
+    job_id = db.insert_job(url="https://example.com/ep", kind="video", status="transcribing")
+    db.update_job(job_id, filepath=video, gen_subs="whisper", gen_subs_lang="zh", translate_to="en")
+    job = db.get_job(job_id)
+
+    calls = []
+
+    def fake_whisper(_job, _src, out_srt, task="transcribe"):
+        calls.append(task)
+        with open(out_srt, "w", encoding="utf-8") as f:
+            f.write("1\n00:00:01,000 --> 00:00:02,000\ntext\n\n")
+        return {"status": "done", "path": out_srt}
+
+    def no_argos(*_a, **_kw):
+        raise AssertionError("argos must not be used when Whisper can produce the target itself")
+
+    orig_whisper, orig_translate = worker.run_whisper_transcribe, worker.run_translate
+    worker.run_whisper_transcribe, worker.run_translate = fake_whisper, no_argos
+    try:
+        result = worker.run_transcribe(job, video, orig_base)
+    finally:
+        worker.run_whisper_transcribe, worker.run_translate = orig_whisper, orig_translate
+
+    assert calls == ["transcribe", "translate"], f"one pass each, got {calls}"
+    names = [os.path.basename(p) for p, _l, _t in result["tracks"]]
+    assert names == ["ep.whisper.srt", "ep.whisper.en.srt"], f"both tracks kept, got {names}"
+    print("ok: an English target uses Whisper's translate task; other targets still route to argos")
+
+
 def test_p8_translate_failure_keeps_transcript():
     """A failed translation must not discard a transcript that succeeded --
     that cost 5 minutes of correct whisper output, written to disk then
@@ -763,10 +808,14 @@ def test_p8_translate_failure_keeps_transcript():
     orig_base = os.path.join(downloads, "ep1")
 
     job_id = db.insert_job(url="https://example.com/ep1", kind="video", status="transcribing")
-    db.update_job(job_id, filepath=video, gen_subs="whisper", gen_subs_lang="zh", translate_to="en")
+    # 'pt', not 'en': English now goes through Whisper's own translate task,
+    # so argos -- the engine whose failure this test is about -- would never
+    # be reached with an English target.
+    db.update_job(job_id, filepath=video, gen_subs="whisper", gen_subs_lang="zh", translate_to="pt")
     job = db.get_job(job_id)
 
-    def fake_whisper(_job, _src, out_srt):
+    def fake_whisper(_job, _src, out_srt, task="transcribe"):
+        assert task == "transcribe", "a non-English target must not use Whisper's translate task"
         with open(out_srt, "w", encoding="utf-8") as f:
             f.write("1\n00:00:01,000 --> 00:00:02,000\n你好\n\n")
         return {"status": "done", "path": out_srt}

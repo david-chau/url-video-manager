@@ -1331,11 +1331,20 @@ def extract_audio_wav(job_id: int, src: str, out_wav: str) -> None:
         raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr)
 
 
-def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> dict:
+def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task: str = "transcribe") -> dict:
     """Blocking. kind='video' jobs get their audio extracted to a temp mono
     16kHz wav first; kind='audio' jobs transcribe current_filepath directly
     (whatever file is current post-separation). Caller
-    (worker._run_transcribe_stage) runs this under TRANSCRIBE_SEM."""
+    (worker._run_transcribe_stage) runs this under TRANSCRIBE_SEM.
+
+    task='translate' makes Whisper emit ENGLISH directly from the audio
+    instead of the spoken language -- a different decoding task, not a
+    post-process, so it needs its own pass over the audio. It is a much
+    better English track than transcribing and then running the text
+    through argos: the model translates from the audio itself, with all the
+    context that carries, rather than from a transcript that has already
+    thrown that away. Whisper's translate task only ever targets English;
+    any other target still goes through argos."""
     job_id = job["id"]
     try:
         from faster_whisper import WhisperModel
@@ -1361,7 +1370,9 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         model = WhisperModel(
             WHISPER_MODEL, device="cpu", compute_type="int8", download_root=WHISPER_MODEL_DIR,
         )
-        segments, info = model.transcribe(audio_src, language=job.get("gen_subs_lang") or None)
+        segments, info = model.transcribe(
+            audio_src, language=job.get("gen_subs_lang") or None, task=task,
+        )
         total = info.duration or 0
         # Same reasoning as run_ocr_transcribe's log line -- which model and
         # which language (hint vs. auto-detected) actually ran is the first
@@ -1370,7 +1381,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
         # is a diagnostic line, not worth risking an unhandled AttributeError
         # over if a future faster-whisper version renames the field.
         detected_lang = getattr(info, "language", "?")
-        append_job_log(job_id, f"whisper: model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
+        append_job_log(job_id, f"whisper: task={task!r} model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
 
         cues = []
         last_flush = 0.0
@@ -1393,7 +1404,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
             # other "restart". Sparse on purpose: this is a liveness
             # signal, not a progress bar.
             if now - last_beat >= HEARTBEAT_SECONDS:
-                log_line(f"[job {job_id}] whisper: {seg.end:.0f}s/{total:.0f}s transcribed, {len(cues)} cues so far")
+                log_line(f"[job {job_id}] whisper[{task}]: {seg.end:.0f}s/{total:.0f}s, {len(cues)} cues so far")
                 last_beat = now
 
         if not cues:
@@ -1401,7 +1412,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str) -> di
             log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
         write_srt(cues, out_srt)
-        append_job_log(job_id, f"whisper: {len(cues)} cues -> {os.path.basename(out_srt)}")
+        append_job_log(job_id, f"whisper[{task}]: {len(cues)} cues -> {os.path.basename(out_srt)}")
         return {"status": "done", "path": out_srt}
     except subprocess.CalledProcessError as e:
         msg = f"ffmpeg audio extraction failed: {e}"
@@ -1663,6 +1674,18 @@ def _add_translated_track(
     return None
 
 
+def is_whisper_translatable(target_lang: str | None) -> bool:
+    """Whether Whisper's own translate task can produce this target.
+
+    It only ever emits English -- the task is 'translate to English', not
+    'translate to X' -- so every other target still goes through argos.
+    Accepts the regional forms too ('en-US', 'en-GB'): they differ from
+    'en' in spelling conventions Whisper doesn't promise anyway, and
+    refusing them would silently route an English request to the weaker
+    engine."""
+    return (target_lang or "").split("-")[0].strip().lower() == "en"
+
+
 def _warn_translate_failed(job_id: int, engine: str, err: dict) -> None:
     """Records a failed translation without failing the job.
 
@@ -1710,11 +1733,24 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
             if target_lang and lang_hint:
                 if job_id in CANCELED:
                     return {"status": "canceled", "error": "canceled by user"}
-                err = _add_translated_track(job, orig_base, out_srt, "whisper", lang_hint, target_lang, tracks)
-                if err is not None:
-                    if err.get("status") == "canceled":
-                        return err
-                    _warn_translate_failed(job_id, "whisper", err)
+                if is_whisper_translatable(target_lang):
+                    # Second decode of the same audio, not a post-process of
+                    # the transcript above -- which is the whole point. See
+                    # run_whisper_transcribe's docstring.
+                    en_srt = f"{orig_base}.whisper.{target_lang}.srt"
+                    result = run_whisper_transcribe(job, current_filepath, en_srt, task="translate")
+                    if result["status"] == "canceled":
+                        return result
+                    if result["status"] != "done":
+                        _warn_translate_failed(job_id, "whisper", result)
+                    else:
+                        tracks.append((en_srt, iso639_2(target_lang), f"whisper -> {target_lang}"))
+                else:
+                    err = _add_translated_track(job, orig_base, out_srt, "whisper", lang_hint, target_lang, tracks)
+                    if err is not None:
+                        if err.get("status") == "canceled":
+                            return err
+                        _warn_translate_failed(job_id, "whisper", err)
 
         # kind='audio' has no frames -- main.py already clamps ocr/both down
         # to whisper at job-creation time, so this only guards a stale row

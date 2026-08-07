@@ -1,6 +1,15 @@
 <title>URL Video Manager</title>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Play triangle over two subtitle bars: video + subtitles, which is what
+     this app is. Inline SVG data URI rather than a served .ico -- no extra
+     file, no route, no binary in the repo, and it stops the /favicon.ico
+     404 that every page load was otherwise logging. Declaring a link also
+     stops the browser probing /favicon.ico at all. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='13' fill='%232563eb'/%3E%3Cpath d='M25 15 L45 28 L25 41 Z' fill='%23fff'/%3E%3Crect x='13' y='47' width='38' height='6' rx='3' fill='%23fff' opacity='.9'/%3E%3Crect x='13' y='56' width='22' height='5' rx='2.5' fill='%23fff' opacity='.55'/%3E%3C/svg%3E">
+<!-- iOS home-screen icon: Safari ignores rel=icon when you "Add to Home
+     Screen" and falls back to a screenshot of the page without this. -->
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='13' fill='%232563eb'/%3E%3Cpath d='M25 15 L45 28 L25 41 Z' fill='%23fff'/%3E%3Crect x='13' y='47' width='38' height='6' rx='3' fill='%23fff' opacity='.9'/%3E%3Crect x='13' y='56' width='22' height='5' rx='2.5' fill='%23fff' opacity='.55'/%3E%3C/svg%3E">
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
@@ -451,6 +460,8 @@
     </div>
     <p class="hint" style="margin:8px 0 0">
       Both languages are required &mdash; argos-translate has no detection of its own. The language-pair model downloads on first use of that pair (tens to a few hundred MB), so the first run of a new pair is slow.
+      <br><br>
+      <strong>For English, "Gen subs" gives a better result.</strong> This translates existing subtitle <em>text</em> via argos. Generating with translate&nbsp;to&nbsp;=&nbsp;en instead runs Whisper's own translate task against the audio, which reads far better &mdash; at the cost of a second transcription pass.
     </p>
   </div>
 </div>
@@ -826,7 +837,6 @@ jobsBody.addEventListener('click', async (e) => {
       try {
         const { files } = await api(`/api/jobs/${id}/files`);
         const mainUrl = fileUrl(j?.filepath);
-        if (mainUrl) videoEl.src = mainUrl;
         // Label tracks by stripping the shared filename stem -- "Title
         // [id].zh-en.srt" -> "zh-en", "Title [id].ocr.en.srt" -> "ocr.en".
         const mainBase = j?.filepath ? j.filepath.split('/').pop().replace(/\.[^.]+$/, '') : null;
@@ -839,8 +849,21 @@ jobsBody.addEventListener('click', async (e) => {
           track.kind = 'subtitles';
           track.label = label;
           track.src = `/api/jobs/${id}/vtt/${encodeURIComponent(f.name)}`;
+          // A track whose VTT finishes loading after playback started only
+          // begins activating cues from that moment -- any cue whose window
+          // already passed never fires, so the captions read as mistimed
+          // until you toggle the track off and on, which forces the browser
+          // to rebuild the active-cue list. Nudging currentTime does the
+          // same rebuild without the manual toggle.
+          track.addEventListener('load', () => {
+            if (!videoEl.paused || videoEl.currentTime > 0) videoEl.currentTime = videoEl.currentTime;
+          });
           videoEl.appendChild(track);
         }
+        // src LAST, after every <track> is in the DOM. Setting it first
+        // started the media loading while tracks were still being appended,
+        // which is what put them out of sync in the first place.
+        if (mainUrl) videoEl.src = mainUrl;
         videoEl.play().catch(() => {}); // autoplay can be blocked -- fine, controls are visible
       } catch (err) {
         alert(err.message);
