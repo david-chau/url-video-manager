@@ -677,6 +677,17 @@ function actionsCell(j) {
     }
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
   }
+  // A playlist parent has no file of its own, so every file-based action
+  // above skipped it -- but it's the obvious place to act on the whole
+  // season at once, instead of ticking 34 checkboxes. Both fan out to the
+  // children that actually have files.
+  if (j.kind === 'playlist' && ['done', 'error', 'canceled'].includes(j.status)) {
+    const kids = jobs.filter(x => x.parent_id === j.id && x.filepath).length;
+    if (kids) {
+      btns.push(`<button data-act="gen-subs-playlist" data-id="${j.id}" title="Generate subtitles for all ${kids} downloaded item(s) in this playlist -- no re-download.">Gen subs (${kids})&hellip;</button>`);
+      btns.push(`<button data-act="translate-subs-playlist" data-id="${j.id}" title="Translate an existing subtitle track on all ${kids} downloaded item(s) -- no re-transcription.">Translate subs (${kids})&hellip;</button>`);
+    }
+  }
   // "this is a playlist, expand it" -- for a watch?v=X&list=Y URL that got
   // classified as a single video by accident (Phase 4 gap).
   if (j.kind !== 'playlist' && !j.parent_id && ['queued', 'done', 'error', 'canceled'].includes(j.status)) {
@@ -792,6 +803,13 @@ jobsBody.addEventListener('click', async (e) => {
     if (act === 'translate-subs') {
       await openTranslateModal(Number(id));
       return; // the modal's Translate button does the POST
+    }
+    if (act === 'gen-subs-playlist' || act === 'translate-subs-playlist') {
+      const kids = jobs.filter(x => x.parent_id === Number(id) && x.filepath).map(x => x.id);
+      if (!kids.length) { alert('No downloaded items in this playlist yet.'); return; }
+      if (act === 'gen-subs-playlist') openRegenModalBatch(kids);
+      else await openTranslateModalBatch(kids);
+      return; // the modal does the POSTs
     }
     if (act === 'log') {
       openLogModal(Number(id));
@@ -1046,11 +1064,29 @@ function closeRegenModal() {
 $('#regenModalClose').addEventListener('click', closeRegenModal);
 $('#regenModal').addEventListener('click', (e) => { if (e.target.id === 'regenModal') closeRegenModal(); });
 
-let translateJobId = null;
+let translateJobIds = [];
+// Batch mode picks a track by SUFFIX rather than by filename: every job has
+// its own '<title> [id].whisper.srt', so one exact name can't address a
+// whole playlist. The suffix ('whisper', 'ocr', 'zh-en', ...) is the part
+// that's actually common across them.
+let translateBySuffix = false;
+
+// '<stem>.whisper.srt' -> 'whisper', given the job whose stem it shares.
+function srtSuffix(job, name) {
+  if (!job?.filepath) return null;
+  let stem = job.filepath.split('/').pop().replace(/\.[^.]+$/, '');
+  // Mirrors worker.resolve_orig_base: sidecars are named against the
+  // PRE-separation stem, so a strip_vocals job's own filepath carries a
+  // '_novocals' its .srt files don't.
+  if (job.strip_vocals && stem.endsWith('_novocals')) stem = stem.slice(0, -'_novocals'.length);
+  if (!name.startsWith(stem + '.') || !name.endsWith('.srt')) return null;
+  return name.slice(stem.length + 1, -'.srt'.length);
+}
 
 async function openTranslateModal(id) {
   const j = jobsById.get(id);
-  translateJobId = id;
+  translateJobIds = [id];
+  translateBySuffix = false;
   const sel = $('#translateSrt');
   sel.innerHTML = '<option>loading&hellip;</option>';
   $('#translateModalTitle').textContent = `Translate subtitles -- ${j?.title || j?.url || `job ${id}`}`;
@@ -1071,29 +1107,89 @@ async function openTranslateModal(id) {
   }
 }
 
+// Batch entry point: one track kind, one language pair, applied to every
+// job that has such a track.
+async function openTranslateModalBatch(ids) {
+  const picked = ids.map(i => jobsById.get(i)).filter(j => j && j.filepath);
+  if (!picked.length) {
+    alert('No selected job has a downloaded file with subtitles to translate.');
+    return;
+  }
+  translateJobIds = picked.map(j => j.id);
+  translateBySuffix = true;
+  const sel = $('#translateSrt');
+  sel.innerHTML = '<option>loading&hellip;</option>';
+  $('#translateModalTitle').textContent = `Translate subtitles -- ${picked.length} job(s)`;
+  const first = picked[0];
+  $('#translateFrom').value = first.gen_subs_lang || '';
+  $('#translateTarget').value = first.translate_to || '';
+  $('#translateModal').style.display = 'block';
+  // Offer the suffixes present on the first job that has any, rather than
+  // querying all 34 -- playlist children are produced by the same pipeline
+  // with the same settings, so they carry the same track kinds. Any job
+  // that turns out not to have the chosen one is reported at the end.
+  try {
+    for (const j of picked) {
+      const { subs } = await api(`/api/jobs/${j.id}/subs`);
+      const suffixes = [...new Set(subs.map(n => srtSuffix(j, n)).filter(Boolean))];
+      if (!suffixes.length) continue;
+      sel.innerHTML = suffixes.map(sfx => `<option value="${escapeHtml(sfx)}">${escapeHtml(sfx)} track</option>`).join('');
+      return;
+    }
+    sel.innerHTML = '<option value="">(none of these jobs has a subtitle file)</option>';
+  } catch (err) {
+    sel.innerHTML = `<option value="">${escapeHtml(err.message)}</option>`;
+  }
+}
+
 function closeTranslateModal() {
   $('#translateModal').style.display = 'none';
-  translateJobId = null;
+  translateJobIds = [];
+  translateBySuffix = false;
 }
 $('#translateModalClose').addEventListener('click', closeTranslateModal);
 $('#translateModal').addEventListener('click', (e) => { if (e.target.id === 'translateModal') closeTranslateModal(); });
 
 $('#translateModalRun').addEventListener('click', async () => {
-  const id = translateJobId;
-  if (id == null) return;
-  const body = {
-    srt_name: $('#translateSrt').value,
-    source_lang: $('#translateFrom').value.trim(),
-    target_lang: $('#translateTarget').value.trim(),
-  };
-  if (!body.srt_name) { alert('No subtitle file to translate.'); return; }
-  if (!body.source_lang || !body.target_lang) { alert('Both languages are required -- argos has no detection.'); return; }
+  const ids = translateJobIds;
+  const bySuffix = translateBySuffix;
+  const picked = $('#translateSrt').value;
+  const source_lang = $('#translateFrom').value.trim();
+  const target_lang = $('#translateTarget').value.trim();
+  if (!ids.length) return;
+  if (!picked) { alert('No subtitle file to translate.'); return; }
+  if (!source_lang || !target_lang) { alert('Both languages are required -- argos has no detection.'); return; }
   closeTranslateModal();
-  try {
-    await api(`/api/jobs/${id}/translate-subs`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-  } catch (err) { alert(err.message); }
+
+  const failures = [];
+  for (const id of ids) {
+    let srt_name = picked;
+    if (bySuffix) {
+      // Resolve the chosen track kind to this job's own filename.
+      try {
+        const { subs } = await api(`/api/jobs/${id}/subs`);
+        srt_name = subs.find(n => srtSuffix(jobsById.get(id), n) === picked);
+      } catch (err) {
+        failures.push(`${jobsById.get(id)?.title || `job ${id}`}: ${err.message}`);
+        continue;
+      }
+      if (!srt_name) {
+        failures.push(`${jobsById.get(id)?.title || `job ${id}`}: no '${picked}' track`);
+        continue;
+      }
+    }
+    try {
+      await api(`/api/jobs/${id}/translate-subs`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ srt_name, source_lang, target_lang }),
+      });
+    } catch (err) {
+      failures.push(`${jobsById.get(id)?.title || `job ${id}`}: ${err.message}`);
+    }
+  }
+  if (failures.length) {
+    alert(`${failures.length} of ${ids.length} job(s) could not start:\n\n${failures.slice(0, 10).join('\n')}`);
+  }
   loadJobs();
 });
 
