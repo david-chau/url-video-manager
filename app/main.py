@@ -23,6 +23,8 @@ TERMINAL_STATUSES = ("done", "error", "canceled")
 async def lifespan(app: FastAPI):
     os.makedirs(worker.DOWNLOADS_DIR, exist_ok=True)
     worker.log_line(f"[startup] {worker.build_stamp()} log={worker.APP_LOG_PATH}")
+    if worker._REPOINTED_HOME:
+        worker.log_line(f"[startup] HOME was not writable, repointed to {worker._REPOINTED_HOME}")
     await asyncio.to_thread(db.init_db)
     n = await asyncio.to_thread(db.reset_stuck_jobs)
     if n:

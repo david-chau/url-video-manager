@@ -28,6 +28,46 @@ AUDIO_FORMAT = os.environ.get("AUDIO_FORMAT")  # unset = passthrough, no re-enco
 DOWNLOADS_DIR = os.environ.get("DOWNLOADS_DIR", "/downloads")
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES")
 
+# Where '~' should point when the real HOME isn't writable.
+APP_HOME = os.environ.get("APP_HOME", "/data/home")
+
+
+def ensure_writable_home(app_home: str = APP_HOME) -> str | None:
+    """Repoints HOME (and the XDG dirs derived from it) at the persistent
+    volume when the inherited HOME can't be written to. Returns the new
+    home, or None if the existing one was already fine.
+
+    compose's `user:` (needed so downloads aren't root-owned in a Synology
+    shared folder) leaves HOME='/', which no non-root user can write. Every
+    library that resolves '~' or an XDG path then dies mid-job, and each
+    one picks a different directory to die on -- faster-whisper's HF cache
+    at '/.cache', argos-translate's data dir at '/.local'. Both were fixed
+    one at a time by pointing that specific tool somewhere else, which
+    fixes exactly the tools already known to break and leaves the next one
+    to fail in production. This fixes the cause instead.
+
+    Must run before any library that reads these is imported; all of them
+    are imported lazily inside their own functions, so module scope here is
+    early enough (the same reasoning ARGOS_PACKAGES_DIR relies on)."""
+    home = os.environ.get("HOME") or ""
+    if home and os.path.isdir(home) and os.access(home, os.W_OK):
+        return None
+    try:
+        os.makedirs(app_home, exist_ok=True)
+    except OSError:
+        # /data not mounted or read-only -- leave HOME alone rather than
+        # pointing it somewhere equally unwritable. The engines will still
+        # fail, but with their own clear message, not a confusing one.
+        return None
+    os.environ["HOME"] = app_home
+    os.environ.setdefault("XDG_DATA_HOME", os.path.join(app_home, ".local", "share"))
+    os.environ.setdefault("XDG_CACHE_HOME", os.path.join(app_home, ".cache"))
+    os.environ.setdefault("XDG_CONFIG_HOME", os.path.join(app_home, ".config"))
+    return app_home
+
+
+_REPOINTED_HOME = ensure_writable_home()
+
 
 def _timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1619,7 +1659,24 @@ def _add_translated_track(
     if result["status"] != "done":
         return result
     tracks.append((out_srt, iso639_2(target_lang), f"{engine} -> {target_lang}"))
+    append_job_log(job["id"], f"translate: {engine} {source_lang} -> {target_lang}, {os.path.basename(out_srt)}")
     return None
+
+
+def _warn_translate_failed(job_id: int, engine: str, err: dict) -> None:
+    """Records a failed translation without failing the job.
+
+    Translation is an optional extra bolted onto the end of a transcript
+    that already succeeded. Failing the whole stage threw away five minutes
+    of correct whisper output -- transcript written to disk, then discarded
+    unmuxed with the job marked 'error' -- because an add-on couldn't reach
+    its model directory. The transcript is the thing that was asked for;
+    ship it, and say clearly what didn't happen on top of it.
+
+    'Translate subs...' on the finished job retries just the translation
+    once the cause is fixed, with no re-transcription."""
+    msg = f"WARNING: translation skipped, transcript kept -- {err.get('error')}"
+    append_job_log(job_id, msg)
 
 
 def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
@@ -1655,7 +1712,9 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
                     return {"status": "canceled", "error": "canceled by user"}
                 err = _add_translated_track(job, orig_base, out_srt, "whisper", lang_hint, target_lang, tracks)
                 if err is not None:
-                    return err
+                    if err.get("status") == "canceled":
+                        return err
+                    _warn_translate_failed(job_id, "whisper", err)
 
         # kind='audio' has no frames -- main.py already clamps ocr/both down
         # to whisper at job-creation time, so this only guards a stale row
@@ -1671,7 +1730,9 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
                     return {"status": "canceled", "error": "canceled by user"}
                 err = _add_translated_track(job, orig_base, out_srt, "ocr", lang_hint, target_lang, tracks)
                 if err is not None:
-                    return err
+                    if err.get("status") == "canceled":
+                        return err
+                    _warn_translate_failed(job_id, "ocr", err)
 
         if not tracks:
             return {"status": "error", "error": "no subtitle tracks generated"}

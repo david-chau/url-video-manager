@@ -752,6 +752,87 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p8_translate_failure_keeps_transcript():
+    """A failed translation must not discard a transcript that succeeded --
+    that cost 5 minutes of correct whisper output, written to disk then
+    thrown away unmuxed, because argos couldn't reach its model dir."""
+    fresh_db()
+    downloads = os.environ["DOWNLOADS_DIR"]
+    video = os.path.join(downloads, "ep1.mp4")
+    open(video, "wb").close()
+    orig_base = os.path.join(downloads, "ep1")
+
+    job_id = db.insert_job(url="https://example.com/ep1", kind="video", status="transcribing")
+    db.update_job(job_id, filepath=video, gen_subs="whisper", gen_subs_lang="zh", translate_to="en")
+    job = db.get_job(job_id)
+
+    def fake_whisper(_job, _src, out_srt):
+        with open(out_srt, "w", encoding="utf-8") as f:
+            f.write("1\n00:00:01,000 --> 00:00:02,000\n你好\n\n")
+        return {"status": "done", "path": out_srt}
+
+    orig_whisper, orig_translate = worker.run_whisper_transcribe, worker.run_translate
+    worker.run_whisper_transcribe = fake_whisper
+    worker.run_translate = lambda *a, **k: {
+        "status": "error", "error": "PermissionError: [Errno 13] Permission denied: '/.local'",
+    }
+    try:
+        result = worker.run_transcribe(job, video, orig_base)
+    finally:
+        worker.run_whisper_transcribe, worker.run_translate = orig_whisper, orig_translate
+
+    assert result["status"] == "done", f"the transcript succeeded, job must not be {result['status']!r}"
+    paths = [os.path.basename(p) for p, _l, _t in result["tracks"]]
+    assert paths == ["ep1.whisper.srt"], f"transcript must still be muxed, got {paths}"
+    log = db.get_job(job_id)["log"] or ""
+    assert "translation skipped" in log and "/.local" in log, "the failure must still be reported, with its cause"
+    print("ok: a failed translation keeps and muxes the transcript, reporting the failure in the log")
+
+
+def test_p8_home_repointed_when_unwritable():
+    """compose's `user:` leaves HOME='/' in the container, which no non-root
+    user can write. Every library resolving '~' or an XDG path then dies
+    mid-job, each on a different directory -- '/.cache' for faster-whisper,
+    '/.local' for argos-translate."""
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    saved = {k: os.environ.get(k) for k in ("HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME")}
+    try:
+        app_home = os.path.join(d, "home")
+        for k in ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"):
+            os.environ.pop(k, None)
+
+        os.environ["HOME"] = "/"  # the actual container value
+        assert worker.ensure_writable_home(app_home) == app_home, "an unwritable HOME must be repointed"
+        assert os.environ["HOME"] == app_home
+        assert os.environ["XDG_DATA_HOME"].startswith(app_home), "argos reads its data dir from XDG, not just HOME"
+        assert os.path.isdir(app_home), "the replacement must actually exist -- libraries mkdir *under* it"
+
+        # A writable HOME is left alone: repointing a normal (root, or
+        # properly-homed) container would scatter files somewhere nobody
+        # expects them.
+        for k in ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"):
+            os.environ.pop(k, None)
+        os.environ["HOME"] = d
+        assert worker.ensure_writable_home(app_home) is None
+        assert os.environ["HOME"] == d
+
+        # Unwritable HOME *and* an unusable replacement: leave HOME as-is
+        # rather than point it somewhere equally broken.
+        os.environ["HOME"] = "/"
+        assert worker.ensure_writable_home("/proc/nope/home") is None
+        assert os.environ["HOME"] == "/"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(d, ignore_errors=True)
+    print("ok: an unwritable HOME is repointed at the persistent volume, a writable one is left alone")
+
+
 def test_p8_app_log_writes_and_rotates(tmp_path=None):
     """log_line must reach the persistent file, and must never take the app
     down when /data isn't writable -- stdout has already carried the line."""
