@@ -301,7 +301,17 @@
       <label title="Language of the source audio/hardsub text, e.g. zh. Required for ocr (picks the right character set) and for translate below (whisper can auto-detect on its own, but a hint still helps).">lang hint:
         <input type="text" id="genSubsLang" placeholder="zh" size="8" list="langCodes">
       </label>
-      <label title="Translate the generated track into a second language via offline argos-translate (no cloud, no API key) -- e.g. en. Needs a lang hint above, since argos-translate can't detect the source language on its own. Both the original and translated tracks are kept, embedded side by side.">translate to:
+      <label title="Whisper model size -- the main accuracy/time tradeoff. Each step up is roughly 3x the runtime: on a NAS Celeron a 4:24 clip takes about 1.5min on tiny, 5min on small, 15min on medium. Models download on first use (75MB for tiny up to ~3GB for large-v3) into /data and are kept, so only the sizes you actually pick cost anything. Ignored when only OCR is running.">whisper model:
+        <select id="whisperModel">
+          <option value="">default (small)</option>
+          <option value="tiny">tiny &mdash; fastest, roughest</option>
+          <option value="base">base</option>
+          <option value="small">small</option>
+          <option value="medium">medium &mdash; ~3x slower, better</option>
+          <option value="large-v3">large-v3 &mdash; best, very slow on a NAS</option>
+        </select>
+      </label>
+      <label title="Translate the generated track into a second language via offline argos-translate (no cloud, no API key) -- e.g. en. Needs a lang hint above, since argos-translate can't detect the source language on its own. Both the original and translated tracks are kept, embedded side by side. For an English target, Whisper's own translate task is used instead of argos -- a second pass over the audio, noticeably better, and it doubles the transcription time.">translate to:
         <input type="text" id="translateTo" placeholder="en" size="8" list="langCodes" disabled>
       </label>
     </div>
@@ -404,6 +414,16 @@
         </select>
       </label>
       <label>lang hint: <input type="text" id="regenGenSubsLang" placeholder="zh" size="8" list="langCodes"></label>
+      <label>whisper model:
+        <select id="regenWhisperModel">
+          <option value="">default (small)</option>
+          <option value="tiny">tiny &mdash; fastest, roughest</option>
+          <option value="base">base</option>
+          <option value="small">small</option>
+          <option value="medium">medium &mdash; ~3x slower, better</option>
+          <option value="large-v3">large-v3 &mdash; best, very slow on a NAS</option>
+        </select>
+      </label>
     </div>
     <div class="controls" id="regenOcrRow">
       <label>ocr lang:
@@ -1043,6 +1063,7 @@ function openRegenModal(id) {
   $('#regenGenSubsLang').value = j?.gen_subs_lang || '';
   $('#regenOcrLang').value = j?.ocr_lang || '';
   $('#regenOcrRegion').value = j?.ocr_region || 'bottom';
+  $('#regenWhisperModel').value = j?.whisper_model || '';
   $('#regenTranslateTo').value = j?.translate_to || '';
   const verb = j?.gen_subs && j.gen_subs !== 'off' ? 'Regenerate' : 'Generate';
   $('#regenModalTitle').textContent = `${verb} subtitles -- ${j?.title || j?.url || `job ${id}`}`;
@@ -1073,6 +1094,7 @@ function openRegenModalBatch(ids) {
   $('#regenGenSubsLang').value = first.gen_subs_lang || '';
   $('#regenOcrLang').value = first.ocr_lang || '';
   $('#regenOcrRegion').value = first.ocr_region || 'bottom';
+  $('#regenWhisperModel').value = first.whisper_model || '';
   $('#regenTranslateTo').value = first.translate_to || '';
   $('#regenModalTitle').textContent = `Generate subtitles -- ${picked.length} selected job(s)`;
   $('#regenVideoWarning').style.display = picked.some(j => j.kind !== 'audio') ? '' : 'none';
@@ -1229,6 +1251,7 @@ $('#regenModalRun').addEventListener('click', async () => {
     translate_to: $('#regenTranslateTo').value.trim(),
     ocr_lang: $('#regenOcrLang').value,
     ocr_region: $('#regenOcrRegion').value,
+    whisper_model: $('#regenWhisperModel').value,
   };
   closeRegenModal();
   // Sequential, not Promise.all: each POST flips a row to 'transcribing'
@@ -1416,6 +1439,7 @@ function formValues() {
     translate_to: $('#translateTo').value.trim() || null,
     ocr_lang: $('#ocrLang').value || null,
     ocr_region: $('#ocrRegion').value,
+    whisper_model: $('#whisperModel').value || null,
   };
 }
 

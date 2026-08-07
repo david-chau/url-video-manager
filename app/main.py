@@ -107,6 +107,7 @@ class AddJobRequest(BaseModel):
     translate_to: str | None = None  # Phase 8 -- e.g. 'en'; needs gen_subs_lang set
     ocr_lang: str | None = None      # verbatim tesseract lang string; overrides the gen_subs_lang mapping
     ocr_region: str = "bottom"       # bottom | full
+    whisper_model: str | None = None # tiny|base|small|medium|large-v3; None = container default
 
 
 class BulkJobRequest(BaseModel):
@@ -125,6 +126,7 @@ class BulkJobRequest(BaseModel):
     translate_to: str | None = None
     ocr_lang: str | None = None
     ocr_region: str = "bottom"
+    whisper_model: str | None = None
     force: bool = False
 
 
@@ -146,6 +148,7 @@ class RegenSubsRequest(BaseModel):
     translate_to: str | None = None
     ocr_lang: str | None = None
     ocr_region: str | None = None
+    whisper_model: str | None = None
 
 
 class TranslateSubsRequest(BaseModel):
@@ -183,7 +186,7 @@ def _create_job(
     sub_primary: str | None = None, sub_secondary: str | None = None,
     container: str = "mp4", gen_subs: str = "off", gen_subs_lang: str | None = None,
     translate_to: str | None = None, ocr_lang: str | None = None,
-    ocr_region: str = "bottom",
+    ocr_region: str = "bottom", whisper_model: str | None = None,
 ) -> dict:
     """Playlist classification is explicit, done at insert time -- not
     guessed at download time. Phase 1's noplaylist=True stays on every
@@ -202,11 +205,17 @@ def _create_job(
     if ocr_region not in worker.OCR_REGIONS:
         ocr_region = "bottom"
     ocr_lang = (ocr_lang or "").strip() or None
+    # Unknown model names are dropped to None (= container default) rather
+    # than passed through: faster-whisper would treat an unrecognized string
+    # as a Hugging Face repo id and download it.
+    if whisper_model not in worker.WHISPER_MODELS:
+        whisper_model = None
     common = dict(
         subs=subs, embed_subs=int(embed_subs), strip_vocals=int(strip_vocals),
         merge_subs=int(bool(merge_subs)), sub_primary=sub_primary, sub_secondary=sub_secondary,
         container=container, gen_subs=gen_subs, gen_subs_lang=gen_subs_lang,
         translate_to=translate_to, ocr_lang=ocr_lang, ocr_region=ocr_region,
+        whisper_model=whisper_model,
     )
     if cls == "playlist":
         job_id = db.insert_job(
@@ -308,8 +317,11 @@ async def api_regen_subs(job_id: int, req: RegenSubsRequest):
     translate_to = req.translate_to if req.translate_to is not None else job.get("translate_to")
     ocr_lang = req.ocr_lang if req.ocr_lang is not None else job.get("ocr_lang")
     ocr_region = req.ocr_region if req.ocr_region is not None else job.get("ocr_region")
+    whisper_model = req.whisper_model if req.whisper_model is not None else job.get("whisper_model")
     if ocr_region not in worker.OCR_REGIONS:
         ocr_region = "bottom"
+    if whisper_model not in worker.WHISPER_MODELS:
+        whisper_model = None
     ocr_lang = (ocr_lang or "").strip() or None
     gen_subs, translate_to = _clamp_gen_subs(job["kind"], gen_subs, gen_subs_lang, translate_to)
     if gen_subs == "off":
@@ -317,7 +329,7 @@ async def api_regen_subs(job_id: int, req: RegenSubsRequest):
 
     await asyncio.to_thread(
         db.update_job, job_id, gen_subs=gen_subs, gen_subs_lang=gen_subs_lang, translate_to=translate_to,
-        ocr_lang=ocr_lang, ocr_region=ocr_region,
+        ocr_lang=ocr_lang, ocr_region=ocr_region, whisper_model=whisper_model,
         status="transcribing", progress=0, error=None, stage=None,
     )
     updated_job = await asyncio.to_thread(db.get_job, job_id)
@@ -378,6 +390,7 @@ async def api_add_job(req: AddJobRequest):
         _create_job, req.url.strip(), req.kind, req.quality, req.subs, req.embed_subs,
         req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
         req.gen_subs, req.gen_subs_lang, req.translate_to, req.ocr_lang, req.ocr_region,
+        req.whisper_model,
     )
 
 
@@ -391,6 +404,7 @@ async def api_bulk_add(req: BulkJobRequest):
             _create_job, url, req.kind, req.quality, req.subs, req.embed_subs,
             req.strip_vocals, req.merge_subs, req.sub_primary, req.sub_secondary, req.container,
             req.gen_subs, req.gen_subs_lang, req.translate_to, req.ocr_lang, req.ocr_region,
+            req.whisper_model,
         )
         added.append(job)
     return {"added": added, "duplicates": dupes}

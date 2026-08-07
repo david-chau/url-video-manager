@@ -6,6 +6,7 @@ import asyncio
 import os
 import tempfile
 import threading
+import time
 
 # DB_PATH / DOWNLOADS_DIR are read as module-level constants at import time,
 # so point them at scratch locations before importing app.db / app.worker.
@@ -750,6 +751,52 @@ def test_p8_translate_subs_rejects_path_traversal():
     listed = asyncio.run(main.api_list_subs(job_id))
     assert listed["subs"] == ["clip.whisper.srt"], f"only this job's own sidecars, got {listed['subs']}"
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
+
+
+def test_p8_whisper_model_is_whitelisted():
+    """The model name reaches WhisperModel(), which treats anything it
+    doesn't recognize as a Hugging Face repo id and downloads it -- so an
+    unchecked string from the client would fetch and run arbitrary model
+    weights. Unknown names must fall back to the container default."""
+    assert worker.whisper_model_for({"whisper_model": "medium"}) == "medium"
+    assert worker.whisper_model_for({"whisper_model": " large-v3 "}) == "large-v3"
+    for bad in ("evil/backdoored-model", "../../etc", "", None, "gpt-4"):
+        assert worker.whisper_model_for({"whisper_model": bad}) == worker.WHISPER_MODEL, f"{bad!r} must fall back"
+    assert worker.whisper_model_for({}) == worker.WHISPER_MODEL
+    print("ok: whisper_model is whitelisted, unknown names fall back to the container default")
+
+
+def test_p8_model_download_watch_is_quiet_when_cached():
+    """The watcher measures directory growth rather than guessing at the
+    huggingface cache layout, so an already-cached model produces no
+    download noise at all."""
+    import shutil
+    import tempfile
+    fresh_db()
+    job_id = db.insert_job(url="https://example.com/x", kind="video", status="transcribing")
+    d = tempfile.mkdtemp()
+    saved_dir, saved_beat = worker.WHISPER_MODEL_DIR, worker.HEARTBEAT_SECONDS
+    worker.WHISPER_MODEL_DIR, worker.HEARTBEAT_SECONDS = d, 0.05
+    try:
+        with open(os.path.join(d, "already-there.bin"), "wb") as f:
+            f.write(b"x" * 4096)
+        with worker._watch_model_download(job_id, "small"):
+            time.sleep(0.2)  # long enough for several watcher ticks
+        log = db.get_job(job_id)["log"] or ""
+        assert "downloading model" not in log, "a cached model must not report a download"
+
+        # ...and a growing directory does get reported.
+        with worker._watch_model_download(job_id, "small"):
+            with open(os.path.join(d, "new-model.bin"), "wb") as f:
+                f.write(b"y" * 2_000_000)
+            time.sleep(0.2)
+        log = db.get_job(job_id)["log"] or ""
+        assert "downloading model 'small'" in log, "a real download must be announced"
+        assert "downloaded, 2MB" in log, f"final size must be reported, got: {log[-200:]}"
+    finally:
+        worker.WHISPER_MODEL_DIR, worker.HEARTBEAT_SECONDS = saved_dir, saved_beat
+        shutil.rmtree(d, ignore_errors=True)
+    print("ok: model download watcher reports real downloads and stays silent for cached models")
 
 
 def test_p8_english_target_uses_whisper_translate():

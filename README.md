@@ -32,7 +32,7 @@ Update later:
 docker compose pull && docker compose up -d --force-recreate
 ```
 
-Whisper and translation models download on first use into `/data` (~500MB for Whisper `small`), not baked into the image — so the first transcription of a fresh install is slow, and later ones aren't.
+Whisper and translation models download on first use into `/data`, not baked into the image — so only the model sizes you actually pick cost anything, each downloaded once and kept. Approximate sizes: `tiny` 75MB, `base` 145MB, `small` 500MB, `medium` 1.5GB, `large-v3` 3GB. The job log and progress cell report that download while it happens.
 
 ## Options
 
@@ -46,7 +46,7 @@ All settings are environment variables in `docker-compose.yml`:
 | `DEMUCS_MODEL` | `htdemucs` | Demucs model; `mdx_extra_q` is faster/lower quality |
 | `KEEP_VOCALS` | unset | Set `1` to keep the isolated vocal track alongside the instrumental |
 | `AUDIO_FORMAT` | unset | Unset = passthrough (no re-encode); set e.g. `mp3` to force one |
-| `WHISPER_MODEL` | `small` | Whisper model size; `base` is faster/lower quality |
+| `WHISPER_MODEL` | `small` | Default Whisper model size, overridable per job in the UI (`tiny`/`base`/`small`/`medium`/`large-v3`). Each step up is roughly 3× the runtime |
 | `WHISPER_MODEL_DIR` | `/data/whisper-models` | Where the Whisper model is downloaded (persists across restarts) |
 | `OCR_SAMPLE_FPS` | `2` | Frames per second sampled for OCR |
 | `OCR_CROP_BOTTOM_PCT` | `0.22` | Bottom fraction of the frame OCR'd (where hardsubs usually sit) |

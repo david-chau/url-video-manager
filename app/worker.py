@@ -4,6 +4,7 @@ yt-dlp is used as a library (not a subprocess) so progress, format probing,
 and playlist enumeration go through a real API instead of stdout regex.
 """
 import asyncio
+import contextlib
 import importlib.util
 import os
 import re
@@ -171,6 +172,27 @@ TRANSCRIBE_SEM = asyncio.Semaphore(TRANSCRIBE_SLOTS)
 # see WITH_TRANSCRIBE in the Dockerfile for the gate that makes this usable
 # at all.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+# Models a job is allowed to request. A whitelist, not passthrough
+# validation: faster-whisper treats an unrecognized name as a Hugging Face
+# repo id and downloads it, so an unchecked string from the client is a
+# "fetch and execute arbitrary model weights" primitive. Sizes here are the
+# standard multilingual set -- '.en' variants are omitted because this app
+# exists for non-English source material.
+#
+# Rough cost on the target NAS, per 4:24 clip, from the measured 'small'
+# run (5m22s): tiny ~1.5min, base ~2.5min, small ~5min, medium ~15min,
+# large-v3 ~45min+. Doubles again when translate_to is set, since that's a
+# second decode of the same audio.
+WHISPER_MODELS = ("tiny", "base", "small", "medium", "large-v3")
+
+
+def whisper_model_for(job: dict) -> str:
+    """The job's requested model, or the container default. Anything not in
+    WHISPER_MODELS falls back rather than raising: a stale row naming a
+    model that's since been dropped from the list should still transcribe,
+    just not with whatever it asked for."""
+    requested = (job.get("whisper_model") or "").strip()
+    return requested if requested in WHISPER_MODELS else WHISPER_MODEL
 OCR_SAMPLE_FPS = float(os.environ.get("OCR_SAMPLE_FPS", "2"))
 OCR_CROP_BOTTOM_PCT = float(os.environ.get("OCR_CROP_BOTTOM_PCT", "0.22"))
 # Tesseract's '+'-joined multi-language syntax. Used when the job has no
@@ -1331,6 +1353,72 @@ def extract_audio_wav(job_id: int, src: str, out_wav: str) -> None:
         raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=stderr)
 
 
+# Approximate on-disk size of each int8 model, for a percentage during the
+# first-use download. Approximate on purpose: the exact figure depends on
+# the ctranslate2 conversion and the tokenizer files that ride along, and
+# being 10% out on a progress readout costs nothing, whereas pinning exact
+# byte counts would need updating every time upstream repacks a model.
+_WHISPER_MODEL_BYTES = {
+    "tiny": 75_000_000,
+    "base": 145_000_000,
+    "small": 500_000_000,
+    "medium": 1_530_000_000,
+    "large-v3": 3_090_000_000,
+}
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass  # a file vanishing mid-walk is normal during a download
+    return total
+
+
+@contextlib.contextmanager
+def _watch_model_download(job_id: int, model_name: str):
+    """Reports first-use model download progress by measuring the download
+    directory, since faster-whisper exposes no progress callback.
+
+    Stays quiet when the model is already cached: nothing is downloaded, the
+    directory doesn't grow, and no line is emitted. That's why this measures
+    growth rather than trying to detect 'is it cached?' up front -- the
+    latter needs the huggingface_hub cache layout, an implementation detail
+    that would silently start lying if it changed."""
+    start_size = _dir_size(WHISPER_MODEL_DIR)
+    expected = _WHISPER_MODEL_BYTES.get(model_name)
+    stop = threading.Event()
+
+    def watch():
+        announced = False
+        while not stop.wait(HEARTBEAT_SECONDS):
+            grown = _dir_size(WHISPER_MODEL_DIR) - start_size
+            if grown <= 0:
+                continue  # already cached, or nothing has landed yet
+            if not announced:
+                announced = True
+                append_job_log(job_id, f"whisper: downloading model {model_name!r} (first use of this size)")
+            mb = grown / 1_000_000
+            pct = f", ~{min(99, int(grown / expected * 100))}%" if expected else ""
+            db.update_job(job_id, stage=f"downloading whisper model ({mb:.0f}MB{pct})")
+            log_line(f"[job {job_id}] whisper: model download {mb:.0f}MB{pct}")
+
+    db.update_job(job_id, stage="loading whisper model")
+    t = threading.Thread(target=watch, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        grown = _dir_size(WHISPER_MODEL_DIR) - start_size
+        if grown > 0:
+            append_job_log(job_id, f"whisper: model {model_name!r} downloaded, {grown / 1_000_000:.0f}MB")
+
+
 def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task: str = "transcribe") -> dict:
     """Blocking. kind='video' jobs get their audio extracted to a temp mono
     16kHz wav first; kind='audio' jobs transcribe current_filepath directly
@@ -1367,9 +1455,16 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
         # than assumed -- /data is a mounted volume, and the first whisper
         # job on a fresh install is exactly when it won't exist yet.
         os.makedirs(WHISPER_MODEL_DIR, exist_ok=True)
-        model = WhisperModel(
-            WHISPER_MODEL, device="cpu", compute_type="int8", download_root=WHISPER_MODEL_DIR,
-        )
+        model_name = whisper_model_for(job)
+        # WhisperModel() blocks while it downloads, with no callback to hook
+        # -- and on a first run that's up to ~3GB of total silence, which is
+        # indistinguishable from a hang (this app has already burned an
+        # afternoon on exactly that confusion once). Watch the download
+        # directory grow instead of asking the library.
+        with _watch_model_download(job_id, model_name):
+            model = WhisperModel(
+                model_name, device="cpu", compute_type="int8", download_root=WHISPER_MODEL_DIR,
+            )
         segments, info = model.transcribe(
             audio_src, language=job.get("gen_subs_lang") or None, task=task,
         )
@@ -1381,7 +1476,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
         # is a diagnostic line, not worth risking an unhandled AttributeError
         # over if a future faster-whisper version renames the field.
         detected_lang = getattr(info, "language", "?")
-        append_job_log(job_id, f"whisper: task={task!r} model={WHISPER_MODEL!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
+        append_job_log(job_id, f"whisper: task={task!r} model={model_name!r} lang_hint={job.get('gen_subs_lang')!r} detected_lang={detected_lang!r}")
 
         cues = []
         last_flush = 0.0

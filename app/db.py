@@ -89,16 +89,23 @@ _ADD_OCR_OPTS = (
     "ALTER TABLE jobs ADD COLUMN ocr_region TEXT;"
 )
 
+# Per-job Whisper model size. NULL = use the WHISPER_MODEL env default.
+# Worth choosing per job rather than per container: model size is the main
+# accuracy/time tradeoff (roughly 3x the runtime per step up), and it's
+# usually worth paying on one difficult video without slowing down every
+# other job on the box.
+_ADD_WHISPER_MODEL = "ALTER TABLE jobs ADD COLUMN whisper_model TEXT;"
+
 # Append-only: each entry is applied once, in order, tracked via
 # PRAGMA user_version. Future phases append here, never edit past entries.
-MIGRATIONS = [SCHEMA, _ADD_CONTAINER, _ADD_GEN_SUBS, _ADD_TRANSLATE, _ADD_OCR_OPTS]
+MIGRATIONS = [SCHEMA, _ADD_CONTAINER, _ADD_GEN_SUBS, _ADD_TRANSLATE, _ADD_OCR_OPTS, _ADD_WHISPER_MODEL]
 
 # Columns writers are allowed to touch via update_job(); keeps callers from
 # typo-ing a column name into a silent no-op.
 _JOB_COLUMNS = {
     "url", "title", "kind", "quality", "container", "subs", "embed_subs", "strip_vocals",
     "merge_subs", "sub_primary", "sub_secondary", "gen_subs", "gen_subs_lang", "translate_to",
-    "ocr_lang", "ocr_region",
+    "ocr_lang", "ocr_region", "whisper_model",
     "parent_id", "child_kind",
     "status", "progress", "stage", "stage_i", "stage_n", "speed", "eta",
     "filepath", "error", "log",
