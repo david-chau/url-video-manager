@@ -62,6 +62,20 @@
   #probeResults tr:hover { background: #f0f4ff; }
   footer { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
   .hint { color: #888; font-size: 12px; }
+  /* Tap target for the title= text, which touch devices never show. Sized
+     to stay finger-hittable (the 44px WCAG target is met with the padding
+     plus the row's own gap) without visually crowding the option it
+     annotates. */
+  button.info {
+    border: none; background: none; padding: 2px 4px; margin: 0;
+    color: #2563eb; font-size: 13px; line-height: 1; cursor: pointer;
+  }
+  button.info:hover { background: none; text-decoration: underline; }
+  button.info[aria-expanded="true"] { text-decoration: underline; }
+  .tip { margin: 2px 0 0; padding: 6px 8px; border-left: 2px solid #2563eb; background: #f0f4ff; border-radius: 0 4px 4px 0; }
+  @media (prefers-color-scheme: dark) {
+    .tip { background: #1e2a44; }
+  }
 
   /* Must come after every rule above -- same-specificity CSS resolves by
      source order, not by which media query looks more "specific". Dark
@@ -122,6 +136,47 @@
     <input type="checkbox" id="soundToggle" checked> sound
   </label>
 </h1>
+
+<!-- Suggestions for every ISO-639-1 language-code box (lang hint, translate
+     to/from). A <datalist> is a native combo box: the browser gives a
+     filter-as-you-type dropdown, but the input stays free text, so a code
+     that isn't listed here still works -- which matters because the three
+     engines support different sets (whisper ~99 languages, argos only the
+     pairs it has models for, tesseract whatever packs are installed) and
+     no single list is right for all of them. Ordered most-used-here first,
+     then alphabetical; the browser shows both value and label. -->
+<datalist id="langCodes">
+  <option value="zh">Chinese</option>
+  <option value="en">English</option>
+  <option value="ja">Japanese</option>
+  <option value="ko">Korean</option>
+  <option value="ar">Arabic</option>
+  <option value="cs">Czech</option>
+  <option value="da">Danish</option>
+  <option value="de">German</option>
+  <option value="el">Greek</option>
+  <option value="es">Spanish</option>
+  <option value="fa">Persian</option>
+  <option value="fi">Finnish</option>
+  <option value="fr">French</option>
+  <option value="he">Hebrew</option>
+  <option value="hi">Hindi</option>
+  <option value="hu">Hungarian</option>
+  <option value="id">Indonesian</option>
+  <option value="it">Italian</option>
+  <option value="ms">Malay</option>
+  <option value="nl">Dutch</option>
+  <option value="no">Norwegian</option>
+  <option value="pl">Polish</option>
+  <option value="pt">Portuguese</option>
+  <option value="ro">Romanian</option>
+  <option value="ru">Russian</option>
+  <option value="sv">Swedish</option>
+  <option value="th">Thai</option>
+  <option value="tr">Turkish</option>
+  <option value="uk">Ukrainian</option>
+  <option value="vi">Vietnamese</option>
+</datalist>
 
 <div class="panel" id="cookiesPanel">
   <div class="controls" style="margin-top:0">
@@ -235,10 +290,10 @@
         </select>
       </label>
       <label title="Language of the source audio/hardsub text, e.g. zh. Required for ocr (picks the right character set) and for translate below (whisper can auto-detect on its own, but a hint still helps).">lang hint:
-        <input type="text" id="genSubsLang" placeholder="zh" size="4">
+        <input type="text" id="genSubsLang" placeholder="zh" size="8" list="langCodes">
       </label>
       <label title="Translate the generated track into a second language via offline argos-translate (no cloud, no API key) -- e.g. en. Needs a lang hint above, since argos-translate can't detect the source language on its own. Both the original and translated tracks are kept, embedded side by side.">translate to:
-        <input type="text" id="translateTo" placeholder="en" size="4" disabled>
+        <input type="text" id="translateTo" placeholder="en" size="8" list="langCodes" disabled>
       </label>
     </div>
     <div class="controls" id="ocrOptionsRow">
@@ -339,7 +394,7 @@
           <option value="both">both</option>
         </select>
       </label>
-      <label>lang hint: <input type="text" id="regenGenSubsLang" placeholder="zh" size="4"></label>
+      <label>lang hint: <input type="text" id="regenGenSubsLang" placeholder="zh" size="8" list="langCodes"></label>
     </div>
     <div class="controls" id="regenOcrRow">
       <label>ocr lang:
@@ -363,7 +418,7 @@
       </label>
     </div>
     <div class="controls">
-      <label>translate to: <input type="text" id="regenTranslateTo" placeholder="en" size="4"></label>
+      <label>translate to: <input type="text" id="regenTranslateTo" placeholder="en" size="8" list="langCodes"></label>
       <span class="spacer"></span>
       <button id="regenModalRun" class="primary" type="button">Regenerate</button>
     </div>
@@ -389,8 +444,8 @@
       </label>
     </div>
     <div class="controls">
-      <label>from: <input type="text" id="translateFrom" placeholder="zh" size="4"></label>
-      <label>to: <input type="text" id="translateTarget" placeholder="en" size="4"></label>
+      <label>from: <input type="text" id="translateFrom" placeholder="zh" size="8" list="langCodes"></label>
+      <label>to: <input type="text" id="translateTarget" placeholder="en" size="8" list="langCodes"></label>
       <span class="spacer"></span>
       <button id="translateModalRun" class="primary" type="button">Translate</button>
     </div>
@@ -398,6 +453,23 @@
       Both languages are required &mdash; argos-translate has no detection of its own. The language-pair model downloads on first use of that pair (tens to a few hundred MB), so the first run of a new pair is slow.
     </p>
   </div>
+</div>
+
+<div class="controls" id="filterRow">
+  <!-- type=search gives the native clear (x) button and, on iOS, a keyboard
+       with a Search key -- neither of which a plain text input has. -->
+  <input type="search" id="filterText" placeholder="Search title or URL&hellip;" style="flex:1; min-width:160px">
+  <label>status:
+    <select id="filterStatus">
+      <option value="">all</option>
+      <option value="active">active</option>
+      <option value="queued">queued</option>
+      <option value="done">done</option>
+      <option value="error">error</option>
+      <option value="canceled">canceled</option>
+    </select>
+  </label>
+  <button id="filterClear" type="button">Clear</button>
 </div>
 
 <div style="overflow-x:auto">
@@ -616,20 +688,46 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Filtering is client-side: /api/jobs already returns every row and the SSE
+// tick keeps them live in memory, so a server round-trip per keystroke
+// would buy nothing and lose the live updates. If the table ever grows past
+// a few thousand rows this becomes a query parameter instead.
+function jobMatches(j) {
+  const q = ($('#filterText').value || '').trim().toLowerCase();
+  const status = $('#filterStatus').value;
+  if (q && !`${j.title || ''} ${j.url || ''}`.toLowerCase().includes(q)) return false;
+  if (status === 'active') return ACTIVE_STATUSES.includes(j.status);
+  if (status && j.status !== status) return false;
+  return true;
+}
+
 function render() {
   const parents = jobs.filter(j => !j.parent_id);
   const rows = [];
+  let shown = 0;
   for (const p of parents) {
+    const kids = p.kind === 'playlist' ? jobs.filter(x => x.parent_id === p.id) : [];
+    const matchingKids = kids.filter(jobMatches);
+    // A playlist parent stays visible when any of its children match, or
+    // its own title does -- hiding the parent would orphan the children
+    // and lose the grouping the indentation exists to show.
+    if (!jobMatches(p) && !matchingKids.length) continue;
     rows.push(rowHtml(p, false));
-    if (p.kind === 'playlist') {
-      for (const c of jobs.filter(x => x.parent_id === p.id)) rows.push(rowHtml(c, true));
+    shown++;
+    for (const c of (jobMatches(p) && !matchingKids.length ? kids : matchingKids)) {
+      rows.push(rowHtml(c, true));
+      shown++;
     }
   }
-  jobsBody.innerHTML = rows.join('') || '<tr><td colspan="5" class="meta">No jobs yet.</td></tr>';
+  const filtering = ($('#filterText').value || '').trim() || $('#filterStatus').value;
+  const empty = filtering ? 'No jobs match this filter.' : 'No jobs yet.';
+  jobsBody.innerHTML = rows.join('') || `<tr><td colspan="5" class="meta">${empty}</td></tr>`;
 
   const running = jobs.filter(j => ACTIVE_STATUSES.includes(j.status)).length;
   const queued = jobs.filter(j => j.status === 'queued').length;
-  $('#counts').textContent = `${running} running · ${queued} queued`;
+  const counts = [`${running} running`, `${queued} queued`];
+  if (filtering) counts.push(`${shown} of ${jobs.length} shown`);
+  $('#counts').textContent = counts.join(' · ');
 }
 
 function rowHtml(j, isChild) {
@@ -1050,6 +1148,69 @@ $('#subs').addEventListener('input', updateFormState);
 $('#genSubs').addEventListener('change', updateFormState);
 $('#genSubsLang').addEventListener('input', updateFormState);
 updateFormState();
+
+// title= text is unreachable on touch -- there's no hover, and iOS shows
+// nothing on long-press for a <label>. So every explanation written into a
+// title was desktop-only, which is where most of this app gets used from a
+// phone. Give each one a tappable info button instead.
+//
+// Driven off the existing title attributes rather than duplicated markup:
+// one source of truth, and a title added later gets a button for free. The
+// title stays put so desktop hover keeps working as before.
+function addInfoButtons(root = document) {
+  // Only labels inside a .controls row: that's every real form option, and
+  // it keeps the block-level tip out of places it can't legally go (the
+  // sound toggle lives in the <h1>).
+  for (const label of root.querySelectorAll('.controls label[title]')) {
+    if (label.dataset.infoAdded) continue;
+    label.dataset.infoAdded = '1';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'info';
+    btn.textContent = 'ⓘ'; // circled i
+    btn.setAttribute('aria-label', 'Explain this option');
+    btn.setAttribute('aria-expanded', 'false');
+
+    const tip = document.createElement('p');
+    tip.className = 'hint tip';
+    tip.textContent = label.getAttribute('title');
+    tip.hidden = true;
+    btn.setAttribute('aria-controls', tip.id = `tip-${Math.random().toString(36).slice(2, 9)}`);
+
+    // Sibling of the label, not a child: a <button> inside a <label>
+    // still triggers the label's activation behaviour, so tapping the
+    // info icon would also toggle the checkbox or focus the select it
+    // annotates. The row is a flex container, so the tip goes after the
+    // whole row rather than inline, where it would be squeezed into a
+    // sliver of column width.
+    label.insertAdjacentElement('afterend', btn);
+    // After the row, but below any tip already parked there -- inserting
+    // straight after the row every time would stack them in reverse of the
+    // order their labels appear in.
+    const row = label.closest('.controls');
+    let anchor = row;
+    while (anchor.nextElementSibling?.classList.contains('tip')) anchor = anchor.nextElementSibling;
+    anchor.insertAdjacentElement('afterend', tip);
+
+    btn.addEventListener('click', () => {
+      tip.hidden = !tip.hidden;
+      btn.setAttribute('aria-expanded', String(!tip.hidden));
+    });
+  }
+}
+addInfoButtons();
+
+// render() reads the filter controls directly, so re-rendering is the whole
+// implementation -- the SSE tick and loadJobs() both already call it, which
+// is what keeps a filtered view live rather than frozen at the moment it
+// was typed.
+$('#filterText').addEventListener('input', render);
+$('#filterStatus').addEventListener('change', render);
+$('#filterClear').addEventListener('click', () => {
+  $('#filterText').value = '';
+  $('#filterStatus').value = '';
+  render();
+});
 
 function formValues() {
   return {
