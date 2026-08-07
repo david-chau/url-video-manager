@@ -635,30 +635,40 @@ function actionsCell(j) {
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
   } else if (ACTIVE_STATUSES.includes(j.status)) {
     btns.push(`<button data-act="cancel" data-id="${j.id}">Cancel</button>`);
-  } else if (j.status === 'done') {
-    const url = fileUrl(j.filepath);
-    if (url) btns.push(`<a href="${url}" target="_blank"><button>Open</button></a>`);
-    // In-browser player with a real subtitle-track picker (HTML5 <track>,
-    // converted from .srt to WebVTT server-side). 'Open' just hands the
-    // browser a bare file URL -- no UI for external subs, and inconsistent
-    // support for embedded ones depending on codec/container.
-    btns.push(`<button data-act="play" data-id="${j.id}">Play&hellip;</button>`);
-    // Lists every artifact (main file + every .srt sidecar) as individually
-    // downloadable -- 'Open' only ever surfaced the main muxed file, and
-    // subtitle sidecars had no download path in the UI at all before this.
-    btns.push(`<button data-act="files" data-id="${j.id}">Files&hellip;</button>`);
-    // Re-runs whisper/ocr/translate against the file already on disk --
-    // no re-download. Only shown once a job actually generated something,
-    // for exactly the "the OCR result was wrong, fix and rerun" case.
-    if (j.gen_subs && j.gen_subs !== 'off') {
-      btns.push(`<button data-act="regen-subs" data-id="${j.id}" title="Re-run subtitle generation using this job's already-downloaded file -- no re-download.">Regen subs</button>`);
+  } else if (['done', 'error', 'canceled'].includes(j.status)) {
+    if (j.status !== 'done') {
+      btns.push(`<button data-act="retry" data-id="${j.id}" title="Re-run this job from the start, re-downloading if needed.">Retry</button>`);
     }
-    // Shown for every finished job, not just generated-subs ones: an
-    // uploaded or downloaded .srt is just as translatable as a whisper one.
-    btns.push(`<button data-act="translate-subs" data-id="${j.id}" title="Translate one of this job's existing subtitle files into another language -- no re-transcription.">Translate subs&hellip;</button>`);
-    btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
-  } else if (['error', 'canceled'].includes(j.status)) {
-    btns.push(`<button data-act="retry" data-id="${j.id}">Retry</button>`);
+    // Everything below works off the file already on disk, so it belongs to
+    // any job that got far enough to produce one -- not just successful
+    // ones. A job that fails LATE (translate couldn't reach its model dir,
+    // mux failed) still has a complete video and its .srt sidecars sitting
+    // there, and offering only Retry meant re-running a five-minute whisper
+    // pass to get back to output that already existed. The API already
+    // accepts done/error/canceled for these; the UI just wasn't showing
+    // them.
+    if (j.filepath) {
+      const url = fileUrl(j.filepath);
+      if (url) btns.push(`<a href="${url}" target="_blank"><button>Open</button></a>`);
+      // In-browser player with a real subtitle-track picker (HTML5 <track>,
+      // converted from .srt to WebVTT server-side). 'Open' just hands the
+      // browser a bare file URL -- no UI for external subs, and inconsistent
+      // support for embedded ones depending on codec/container.
+      btns.push(`<button data-act="play" data-id="${j.id}">Play&hellip;</button>`);
+      // Lists every artifact (main file + every .srt sidecar) as individually
+      // downloadable -- 'Open' only ever surfaced the main muxed file, and
+      // subtitle sidecars had no download path in the UI at all before this.
+      btns.push(`<button data-act="files" data-id="${j.id}">Files&hellip;</button>`);
+      // Re-runs whisper/ocr/translate against the file already on disk --
+      // no re-download, for exactly the "the OCR result was wrong, fix and
+      // rerun" case.
+      if (j.gen_subs && j.gen_subs !== 'off') {
+        btns.push(`<button data-act="regen-subs" data-id="${j.id}" title="Re-run subtitle generation using this job's already-downloaded file -- no re-download.">Regen subs</button>`);
+      }
+      // Not gated on gen_subs: an uploaded or downloaded .srt is just as
+      // translatable as a whisper-generated one.
+      btns.push(`<button data-act="translate-subs" data-id="${j.id}" title="Translate one of this job's existing subtitle files into another language -- no re-transcription.">Translate subs&hellip;</button>`);
+    }
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
   }
   // "this is a playlist, expand it" -- for a watch?v=X&list=Y URL that got
@@ -668,7 +678,7 @@ function actionsCell(j) {
   }
   // external subtitle upload (Phase 6c) -- only makes sense once there's an
   // output to mux into.
-  if (j.kind !== 'playlist' && j.status === 'done') {
+  if (j.kind !== 'playlist' && j.filepath && ['done', 'error', 'canceled'].includes(j.status)) {
     btns.push(`<button data-act="upload-sub" data-id="${j.id}" title="Got a better subtitle file from elsewhere (a subtitle site, a manual translation)? Upload it here to embed instead of what was auto-downloaded/generated.">Upload subs&hellip;</button>`);
   }
   // Full log/error text -- the progress cell only ever showed a 40-char
