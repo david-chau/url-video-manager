@@ -226,11 +226,11 @@
   <div class="field-group">
     <span class="field-group-label">Generate subtitles (for burned-in/hardsub text, or no real track at all)</span>
     <div class="controls">
-      <label title="off: don't generate. whisper: transcribes the spoken audio (works for video or audio jobs). ocr: reads the actual burned-in subtitle pixels off video frames (video only, more accurate to on-screen text, heavier). both: run both engines, keep both tracks.">gen subs:
+      <label title="off: don't generate. whisper: transcribes the spoken audio (video or audio jobs) -- the reliable one, use it unless the audio is unusable. ocr: reads burned-in subtitle pixels off video frames (video only); accuracy depends heavily on how the subtitles are styled, and stylized ones come back as noise -- for videos with no usable speech. both: run both engines, keep both tracks.">gen subs:
         <select id="genSubs">
           <option value="off" selected>off</option>
-          <option value="whisper">whisper</option>
-          <option value="ocr">ocr</option>
+          <option value="whisper">whisper (recommended)</option>
+          <option value="ocr">ocr (hardsubs only)</option>
           <option value="both">both</option>
         </select>
       </label>
@@ -334,8 +334,8 @@
     <div class="controls">
       <label>engine:
         <select id="regenGenSubs">
-          <option value="whisper">whisper</option>
-          <option value="ocr">ocr</option>
+          <option value="whisper">whisper (recommended)</option>
+          <option value="ocr">ocr (hardsubs only)</option>
           <option value="both">both</option>
         </select>
       </label>
@@ -369,6 +369,33 @@
     </div>
     <p class="hint" id="regenVideoWarning" style="margin:8px 0 0; display:none">
       Note: for video jobs this <strong>adds</strong> another subtitle track rather than replacing the old one &mdash; pick the right one in your player, or delete + re-add for a single-track file.
+    </p>
+  </div>
+</div>
+
+<div id="translateModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:10">
+  <div class="modal-box" style="max-width:480px; margin:8vh auto; padding:16px; border-radius:8px">
+    <div class="controls" style="margin-top:0">
+      <strong id="translateModalTitle" style="font-size:14px">Translate subtitles</strong>
+      <span class="spacer"></span>
+      <button id="translateModalClose" type="button">Cancel</button>
+    </div>
+    <p class="hint" style="margin:8px 0 0">
+      Translates an existing subtitle file &mdash; no re-transcription. The original track is kept alongside the translation.
+    </p>
+    <div class="controls">
+      <label style="flex:1">source track:
+        <select id="translateSrt" style="flex:1; min-width:0"></select>
+      </label>
+    </div>
+    <div class="controls">
+      <label>from: <input type="text" id="translateFrom" placeholder="zh" size="4"></label>
+      <label>to: <input type="text" id="translateTarget" placeholder="en" size="4"></label>
+      <span class="spacer"></span>
+      <button id="translateModalRun" class="primary" type="button">Translate</button>
+    </div>
+    <p class="hint" style="margin:8px 0 0">
+      Both languages are required &mdash; argos-translate has no detection of its own. The language-pair model downloads on first use of that pair (tens to a few hundred MB), so the first run of a new pair is slow.
     </p>
   </div>
 </div>
@@ -554,6 +581,9 @@ function actionsCell(j) {
     if (j.gen_subs && j.gen_subs !== 'off') {
       btns.push(`<button data-act="regen-subs" data-id="${j.id}" title="Re-run subtitle generation using this job's already-downloaded file -- no re-download.">Regen subs</button>`);
     }
+    // Shown for every finished job, not just generated-subs ones: an
+    // uploaded or downloaded .srt is just as translatable as a whisper one.
+    btns.push(`<button data-act="translate-subs" data-id="${j.id}" title="Translate one of this job's existing subtitle files into another language -- no re-transcription.">Translate subs&hellip;</button>`);
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
   } else if (['error', 'canceled'].includes(j.status)) {
     btns.push(`<button data-act="retry" data-id="${j.id}">Retry</button>`);
@@ -644,6 +674,10 @@ jobsBody.addEventListener('click', async (e) => {
     if (act === 'regen-subs') {
       openRegenModal(Number(id));
       return; // the modal's Regenerate button does the POST
+    }
+    if (act === 'translate-subs') {
+      await openTranslateModal(Number(id));
+      return; // the modal's Translate button does the POST
     }
     if (act === 'log') {
       openLogModal(Number(id));
@@ -737,7 +771,15 @@ soundToggle.addEventListener('change', () => {
 let logPollTimer = null;
 
 function renderLogModal(j, id) {
-  $('#logModalTitle').textContent = j?.title || j?.url || `job ${id}`;
+  // Live status in the title: the log itself only gains a line at stage
+  // boundaries, so during a multi-minute whisper run it looks frozen even
+  // though progress is ticking. This is the "is it still moving?" answer.
+  const title = j?.title || j?.url || `job ${id}`;
+  const bits = [];
+  if (j?.status) bits.push(j.status);
+  if (j?.stage) bits.push(j.stage);
+  if (typeof j?.progress === 'number' && ACTIVE_STATUSES.includes(j.status)) bits.push(`${j.progress}%`);
+  $('#logModalTitle').textContent = bits.length ? `${title} -- ${bits.join(' ')}` : title;
   const parts = [];
   if (j?.error) parts.push(`ERROR: ${j.error}`);
   if (j?.log) parts.push(j.log);
@@ -856,6 +898,57 @@ function closeRegenModal() {
 }
 $('#regenModalClose').addEventListener('click', closeRegenModal);
 $('#regenModal').addEventListener('click', (e) => { if (e.target.id === 'regenModal') closeRegenModal(); });
+
+let translateJobId = null;
+
+async function openTranslateModal(id) {
+  const j = jobsById.get(id);
+  translateJobId = id;
+  const sel = $('#translateSrt');
+  sel.innerHTML = '<option>loading&hellip;</option>';
+  $('#translateModalTitle').textContent = `Translate subtitles -- ${j?.title || j?.url || `job ${id}`}`;
+  // Prefill from the job's own settings: the lang hint that produced the
+  // transcript is the source, and translate_to is usually where it's going.
+  $('#translateFrom').value = j?.gen_subs_lang || '';
+  $('#translateTarget').value = j?.translate_to || '';
+  $('#translateModal').style.display = 'block';
+  try {
+    const { subs } = await api(`/api/jobs/${id}/subs`);
+    if (!subs.length) {
+      sel.innerHTML = '<option value="">(no subtitle files for this job)</option>';
+      return;
+    }
+    sel.innerHTML = subs.map(s => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
+  } catch (err) {
+    sel.innerHTML = `<option value="">${escapeHtml(err.message)}</option>`;
+  }
+}
+
+function closeTranslateModal() {
+  $('#translateModal').style.display = 'none';
+  translateJobId = null;
+}
+$('#translateModalClose').addEventListener('click', closeTranslateModal);
+$('#translateModal').addEventListener('click', (e) => { if (e.target.id === 'translateModal') closeTranslateModal(); });
+
+$('#translateModalRun').addEventListener('click', async () => {
+  const id = translateJobId;
+  if (id == null) return;
+  const body = {
+    srt_name: $('#translateSrt').value,
+    source_lang: $('#translateFrom').value.trim(),
+    target_lang: $('#translateTarget').value.trim(),
+  };
+  if (!body.srt_name) { alert('No subtitle file to translate.'); return; }
+  if (!body.source_lang || !body.target_lang) { alert('Both languages are required -- argos has no detection.'); return; }
+  closeTranslateModal();
+  try {
+    await api(`/api/jobs/${id}/translate-subs`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+  } catch (err) { alert(err.message); }
+  loadJobs();
+});
 
 $('#regenModalRun').addEventListener('click', async () => {
   const id = regenJobId;

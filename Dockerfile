@@ -50,7 +50,13 @@ RUN if [ "$WITH_DEMUCS" = "true" ]; then pip install --no-cache-dir demucs; fi
 # verify ctranslate2 doesn't before relying on this on the actual NAS, don't
 # just assume). Same shape as WITH_DEMUCS above: fails fast with a clear
 # error at job time instead of being installed unconditionally.
-ARG WITH_TRANSCRIBE=false
+#
+# Now defaults to true and ships in :latest: ctranslate2 was the open
+# question here and it's answered -- verified on the actual DS920+ Celeron
+# J4125 (non-AVX), transcribing a 4:24 clip in 5m22s with model='small',
+# no illegal instruction. A separate :transcribe tag only meant the NAS ran
+# a manually-built image that pushes to main never rebuilt.
+ARG WITH_TRANSCRIBE=true
 RUN if [ "$WITH_TRANSCRIBE" = "true" ]; then pip install --no-cache-dir faster-whisper; fi
 
 # Phase 8: argos-translate (offline NMT subtitle translation) -- chosen over
@@ -64,10 +70,22 @@ RUN if [ "$WITH_TRANSCRIBE" = "true" ]; then pip install --no-cache-dir faster-w
 # Language-pair models are NOT baked in here; they're downloaded into
 # TRANSLATE_MODEL_DIR (under /data, the persistent volume) the first time a
 # given pair is used -- see worker.get_argos_translator.
-ARG WITH_TRANSLATE=false
+#
+# Also defaults to true now, for the same reason WITH_TRANSCRIBE does: a
+# build flag that has to be flipped by hand means the feature is missing
+# from the image the NAS actually pulls, which is how "translate my zh subs
+# to en" turned out to be uninstallable rather than merely unused. The
+# ~1.3GB is the cost of that being available at all.
+ARG WITH_TRANSLATE=true
 RUN if [ "$WITH_TRANSLATE" = "true" ]; then pip install --no-cache-dir argostranslate; fi
 
 COPY app ./app
+
+# Which commit this image was built from, stamped into every job's log (see
+# worker.build_stamp). "which build ran this job?" was unanswerable from the
+# UI while a stale image was the actual cause of a bug being investigated.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
 
 ENV DOWNLOADS_DIR=/downloads \
     DB_PATH=/data/jobs.db \

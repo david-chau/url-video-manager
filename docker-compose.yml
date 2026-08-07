@@ -5,15 +5,12 @@
 # check the plan's Synology section first, non-AVX CPUs may not run torch at
 # all. That variant is manual-only: Actions tab -> Publish image -> Run
 # workflow -> with_demucs, tagged :demucs rather than overwriting :latest.
-# Hardsub subtitle generation (Phase 7, gen_subs='whisper'/'ocr'/'both')
-# needs a WITH_TRANSCRIBE=true build for the Whisper half -- same
-# manual-only :transcribe tag, same non-AVX caveat as demucs (see the
-# Dockerfile's WITH_TRANSCRIBE comment). OCR (tesseract) needs no build
-# flag at all -- it's in every image.
-# Subtitle translation (Phase 8, translate_to) needs a WITH_TRANSLATE=true
-# build (argos-translate/ctranslate2, same size/risk as WITH_TRANSCRIBE) --
-# same manual-only :translate tag. Language-pair models download into
-# TRANSLATE_MODEL_DIR (under /data) on first use, not baked into the image.
+# Whisper subtitle generation (Phase 7) and subtitle translation (Phase 8)
+# are both in :latest now -- no build flag, no separate tag. ctranslate2 is
+# verified working on this NAS's non-AVX Celeron (a 4:24 clip transcribed
+# in 5m22s with WHISPER_MODEL=small). Whisper and language-pair models
+# download into WHISPER_MODEL_DIR / TRANSLATE_MODEL_DIR (both under /data)
+# on first use rather than being baked into the image.
 services:
   app:
     image: ghcr.io/david-chau/url-video-manager:latest

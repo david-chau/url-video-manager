@@ -9,14 +9,6 @@ on:
         description: "Also build/push the WITH_DEMUCS=true (vocal-stripping) variant, tagged :demucs. Pulls ~2GB of torch, slow."
         type: boolean
         default: false
-      with_transcribe:
-        description: "Also build/push the WITH_TRANSCRIBE=true (Whisper hardsub ASR) variant, tagged :transcribe."
-        type: boolean
-        default: false
-      with_translate:
-        description: "Also build/push the WITH_TRANSLATE=true (argos-translate offline subtitle translation) variant, tagged :translate."
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -50,12 +42,22 @@ jobs:
 
       # Target is a Synology DS920+ (Celeron J4125, x86_64) -- linux/amd64
       # regardless of what the runner's own arch is.
+      #
+      # :latest carries whisper AND translate (the Dockerfile defaults both
+      # to true now). They used to be manual-only :transcribe/:translate
+      # tags, which meant the NAS pointing at one of them sat on a
+      # hand-built image that pushes to main never refreshed -- and the
+      # other feature was simply absent from whichever tag it was running.
+      # Demucs stays separate below: still ~2GB of torch, still unproven on
+      # this non-AVX CPU.
       - uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64
           push: true
-          build-args: WITH_DEMUCS=false
+          build-args: |
+            WITH_DEMUCS=false
+            GIT_SHA=${{ github.sha }}
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
@@ -71,36 +73,11 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          build-args: WITH_DEMUCS=true
+          build-args: |
+            WITH_DEMUCS=true
+            GIT_SHA=${{ github.sha }}
           tags: ghcr.io/${{ github.repository }}:demucs
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Manual-only, same reasoning as with_demucs above: faster-whisper's
-      # ctranslate2 backend is expected to fare better than torch on a
-      # non-AVX CPU but this hasn't been proven on the actual NAS hardware.
-      - if: ${{ inputs.with_transcribe }}
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          build-args: WITH_TRANSCRIBE=true
-          tags: ghcr.io/${{ github.repository }}:transcribe
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-      # Manual-only, same reasoning as with_demucs/with_transcribe above.
-      # WITH_TRANSCRIBE stays false here -- a combined Whisper+translate
-      # build is a one-line edit to this step's build-args if/when someone
-      # actually wants that, not a tag worth building by default.
-      - if: ${{ inputs.with_translate }}
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          build-args: WITH_TRANSLATE=true
-          tags: ghcr.io/${{ github.repository }}:translate
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

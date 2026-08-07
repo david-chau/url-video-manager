@@ -22,6 +22,7 @@ TERMINAL_STATUSES = ("done", "error", "canceled")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(worker.DOWNLOADS_DIR, exist_ok=True)
+    worker.log_line(f"[startup] {worker.build_stamp()} log={worker.APP_LOG_PATH}")
     await asyncio.to_thread(db.init_db)
     n = await asyncio.to_thread(db.reset_stuck_jobs)
     if n:
@@ -143,6 +144,12 @@ class RegenSubsRequest(BaseModel):
     translate_to: str | None = None
     ocr_lang: str | None = None
     ocr_region: str | None = None
+
+
+class TranslateSubsRequest(BaseModel):
+    srt_name: str                    # bare filename of one of this job's own .srt sidecars
+    source_lang: str                 # e.g. 'zh' -- argos has no detection, so both are required
+    target_lang: str                 # e.g. 'en'
 
 
 # ------------------------------------------------------------- helpers
@@ -314,6 +321,51 @@ async def api_regen_subs(job_id: int, req: RegenSubsRequest):
     updated_job = await asyncio.to_thread(db.get_job, job_id)
     asyncio.create_task(worker.resume_transcribe(updated_job))
     return updated_job
+
+
+@app.post("/api/jobs/{job_id}/translate-subs")
+async def api_translate_subs(job_id: int, req: TranslateSubsRequest):
+    """Translates one .srt already on disk into another language and muxes
+    it in, without re-running whisper/OCR. The translate_to option on
+    generation can only translate what that same run produced, so getting
+    en out of an existing good zh transcript otherwise meant transcribing
+    the whole file again just to reach the translate step on the end."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in ("done", "error", "canceled"):
+        raise HTTPException(400, "job is currently active, cancel it first")
+    if not job.get("filepath") or not os.path.exists(job["filepath"]):
+        raise HTTPException(400, "no downloaded file on disk for this job")
+
+    source_lang = (req.source_lang or "").strip()
+    target_lang = (req.target_lang or "").strip()
+    if not source_lang or not target_lang:
+        raise HTTPException(400, "source_lang and target_lang are both required -- argos has no language detection")
+    if source_lang == target_lang:
+        raise HTTPException(400, "source and target language are the same")
+
+    # Resolve the requested name against this job's own sidecars rather
+    # than joining it onto a directory: a raw name from the client would
+    # otherwise be a path-traversal write primitive ('../../etc/x.srt').
+    srts = {os.path.basename(p): p for p in await asyncio.to_thread(worker.list_job_files, job) if p.endswith(".srt")}
+    src_srt = srts.get(os.path.basename(req.srt_name or ""))
+    if not src_srt:
+        raise HTTPException(400, f"no such subtitle file for this job: {req.srt_name!r}")
+
+    asyncio.create_task(worker.translate_existing_subs(job, src_srt, source_lang, target_lang))
+    return await asyncio.to_thread(db.get_job, job_id)
+
+
+@app.get("/api/jobs/{job_id}/subs")
+async def api_list_subs(job_id: int):
+    """The job's .srt sidecars by bare filename -- what the translate modal
+    offers as source tracks."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    files = await asyncio.to_thread(worker.list_job_files, job)
+    return {"subs": [os.path.basename(p) for p in files if p.endswith(".srt")]}
 
 
 @app.post("/api/jobs")

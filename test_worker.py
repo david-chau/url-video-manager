@@ -704,6 +704,72 @@ def test_p7_resume_crash_marks_job_errored():
     print("ok: an exception in a resume task marks the job errored instead of freezing it")
 
 
+def test_p8_translate_subs_rejects_path_traversal():
+    """srt_name arrives from the client and is used to pick a file to read.
+    Resolving it against the job's own sidecars (not by joining it onto a
+    directory) is what keeps '../../etc/passwd' from being reachable."""
+    from fastapi.testclient import TestClient
+
+    fresh_db()
+    downloads = os.environ["DOWNLOADS_DIR"]
+    video = os.path.join(downloads, "clip.mp4")
+    open(video, "wb").close()
+    good = os.path.join(downloads, "clip.whisper.srt")
+    with open(good, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:01,000 --> 00:00:02,000\n你好\n\n")
+    # A .srt outside the job's own stem -- must not be reachable by name.
+    outsider = os.path.join(downloads, "someone-elses.srt")
+    open(outsider, "w").close()
+
+    job_id = db.insert_job(url="https://example.com/clip", kind="video", status="done")
+    db.update_job(job_id, filepath=video, gen_subs="whisper", gen_subs_lang="zh")
+
+    with TestClient(main.app) as client:
+        for bad in ("../../etc/passwd", "someone-elses.srt", "clip.nope.srt", ""):
+            r = client.post(f"/api/jobs/{job_id}/translate-subs",
+                            json={"srt_name": bad, "source_lang": "zh", "target_lang": "en"})
+            assert r.status_code == 400, f"{bad!r} must be rejected, got {r.status_code}"
+
+        # Same language in and out is a no-op that would still burn a model
+        # download, and a missing language can't be guessed -- argos has no
+        # detection.
+        r = client.post(f"/api/jobs/{job_id}/translate-subs",
+                        json={"srt_name": "clip.whisper.srt", "source_lang": "zh", "target_lang": "zh"})
+        assert r.status_code == 400
+        r = client.post(f"/api/jobs/{job_id}/translate-subs",
+                        json={"srt_name": "clip.whisper.srt", "source_lang": "", "target_lang": "en"})
+        assert r.status_code == 400
+
+        r = client.get(f"/api/jobs/{job_id}/subs")
+        assert r.json()["subs"] == ["clip.whisper.srt"], "only this job's own sidecars are offered"
+    print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
+
+
+def test_p8_app_log_writes_and_rotates(tmp_path=None):
+    """log_line must reach the persistent file, and must never take the app
+    down when /data isn't writable -- stdout has already carried the line."""
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    orig_path, orig_max = worker.APP_LOG_PATH, worker.APP_LOG_MAX_BYTES
+    worker.APP_LOG_PATH = os.path.join(d, "app.log")
+    worker.APP_LOG_MAX_BYTES = 200
+    try:
+        worker.log_line("first line")
+        assert "first line" in open(worker.APP_LOG_PATH, encoding="utf-8").read()
+        for i in range(40):
+            worker.log_line(f"filler {i} " + "x" * 20)
+        assert os.path.exists(worker.APP_LOG_PATH + ".1"), "must rotate past APP_LOG_MAX_BYTES"
+        assert os.path.getsize(worker.APP_LOG_PATH) <= worker.APP_LOG_MAX_BYTES + 512
+
+        worker.APP_LOG_PATH = "/proc/definitely/not/writable/app.log"
+        worker.log_line("must not raise")  # the assertion is that this returns
+    finally:
+        worker.APP_LOG_PATH, worker.APP_LOG_MAX_BYTES = orig_path, orig_max
+        shutil.rmtree(d, ignore_errors=True)
+    print("ok: log_line persists to APP_LOG_PATH, rotates, and swallows an unwritable path")
+
+
 def test_p7_missing_whisper_fails_fast():
     fresh_db()
     job_id = db.insert_job(url="https://example.com/show", kind="video", status="transcribing")

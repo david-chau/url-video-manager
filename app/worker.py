@@ -4,6 +4,7 @@ yt-dlp is used as a library (not a subprocess) so progress, format probing,
 and playlist enumeration go through a real API instead of stdout regex.
 """
 import asyncio
+import importlib.util
 import os
 import re
 import shutil
@@ -32,13 +33,53 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+APP_LOG_PATH = os.environ.get("APP_LOG_PATH", "/data/app.log")
+# Rotate at 8MB, keeping one previous file. Small on purpose: this exists so
+# a NAS-side question ("what did it do overnight?") is answerable over SMB
+# without docker, not as a full log-management system.
+APP_LOG_MAX_BYTES = int(os.environ.get("APP_LOG_MAX_BYTES", str(8 * 1024 * 1024)))
+_app_log_lock = threading.Lock()
+
+
 def log_line(msg: str) -> None:
     """Every stdout line the app prints -- job errors, startup recovery --
     goes through this so they're all consistently timestamped. `docker
     logs` timestamps are opt-in (--timestamps) and mark receipt time, not
     necessarily when the underlying event happened; this puts the
-    timestamp in the line itself regardless of how logs get viewed."""
-    print(f"[{_timestamp()}] {msg}", flush=True)
+    timestamp in the line itself regardless of how logs get viewed.
+
+    Also appended to APP_LOG_PATH on the persistent volume. `docker logs`
+    is lost on container recreation, which is exactly when you most want
+    the history (every `compose pull && up -d` discards it), and reading it
+    at all needs shell access to the NAS -- /data is already mounted and
+    browsable over SMB."""
+    line = f"[{_timestamp()}] {msg}"
+    print(line, flush=True)
+    with _app_log_lock:  # log_line is called from worker threads, not just the loop
+        try:
+            if os.path.exists(APP_LOG_PATH) and os.path.getsize(APP_LOG_PATH) > APP_LOG_MAX_BYTES:
+                os.replace(APP_LOG_PATH, APP_LOG_PATH + ".1")
+            os.makedirs(os.path.dirname(APP_LOG_PATH) or ".", exist_ok=True)
+            with open(APP_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            # A read-only or missing /data must never take the app down over
+            # a log line -- stdout above already carried it.
+            pass
+
+
+def build_stamp() -> str:
+    """Which build is running, and which optional engines it actually has.
+    Stamped at the head of every job's log because "is the container even
+    running the code I just pushed?" was the real answer to more than one
+    bug here, and nothing in the UI could answer it -- a stale image looks
+    exactly like a broken feature."""
+    engines = []
+    for name, mod in (("whisper", "faster_whisper"), ("translate", "argostranslate"), ("demucs", "demucs")):
+        if importlib.util.find_spec(mod) is not None:
+            engines.append(name)
+    engines.append("ocr")  # tesseract is unconditional in the image
+    return f"build={os.environ.get('GIT_SHA', 'unknown')[:12]} engines={'+'.join(sorted(engines))}"
 
 
 def append_job_log(job_id: int, msg: str, echo: bool = True) -> None:
@@ -1651,7 +1692,7 @@ async def _run_transcribe_stage(job: dict, orig_base: str, current_filepath: str
     await asyncio.to_thread(
         append_job_log, job_id,
         f"stage: transcribing (engine={job.get('gen_subs')!r} lang_hint={job.get('gen_subs_lang')!r}"
-        f" translate_to={job.get('translate_to')!r})",
+        f" translate_to={job.get('translate_to')!r}) {build_stamp()}",
     )
     async with TRANSCRIBE_SEM:
         result = await asyncio.to_thread(run_transcribe, job, current_filepath, orig_base)
@@ -1812,6 +1853,42 @@ async def resume_transcribe(job: dict) -> None:
         await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
     except Exception as e:
         fail_job(job["id"], e)
+
+
+async def translate_existing_subs(job: dict, src_srt: str, source_lang: str, target_lang: str) -> None:
+    """Translates one .srt already on disk and muxes the result in as an
+    extra track. Distinct from the translate_to option on generation, which
+    can only translate what it just produced -- having a good zh transcript
+    and wanting en out of it shouldn't mean re-running whisper for five
+    minutes to reach the translate step attached to the end of it.
+
+    Reuses the same mux stage the transcribe pipeline ends with, so the
+    output naming, track titles and in-place video rewrite are identical to
+    a translate produced the original way."""
+    job_id = job["id"]
+    try:
+        db.update_job(job_id, status="transcribing", progress=0, stage="translating", error=None)
+        append_job_log(job_id, f"stage: translating {os.path.basename(src_srt)} {source_lang} -> {target_lang} {build_stamp()}")
+        orig_base = resolve_orig_base(job)
+        # Name it off the source track so translating '<stem>.whisper.srt'
+        # gives '<stem>.whisper.en.srt' -- the same shape _add_translated_track
+        # produces inline, rather than a second naming scheme for the same
+        # kind of file.
+        stem = os.path.basename(src_srt)[len(os.path.basename(orig_base)):].lstrip(".")[: -len(".srt")]
+        engine = stem or "sub"
+        out_srt = f"{orig_base}.{engine}.{target_lang}.srt"
+        result = await asyncio.to_thread(
+            run_translate, job, src_srt, source_lang, target_lang, out_srt,
+        )
+        if result["status"] != "done":
+            db.update_job(job_id, status="error", error=result.get("error"))
+            append_job_log(job_id, f"stage: translating failed: {result.get('error')}", echo=False)
+            return
+        append_job_log(job_id, f"translate: {os.path.basename(out_srt)}")
+        tracks = [(out_srt, iso639_2(target_lang), f"{engine} -> {target_lang}")]
+        await _run_subs_and_mux_stage(job, orig_base, job["filepath"], None, tracks)
+    except Exception as e:
+        fail_job(job_id, e)
 
 
 # -------------------------------------------------------------- queue loop
