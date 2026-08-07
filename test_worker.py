@@ -708,7 +708,18 @@ def test_p8_translate_subs_rejects_path_traversal():
     """srt_name arrives from the client and is used to pick a file to read.
     Resolving it against the job's own sidecars (not by joining it onto a
     directory) is what keeps '../../etc/passwd' from being reachable."""
-    from fastapi.testclient import TestClient
+    # The endpoints are called directly rather than through TestClient:
+    # starlette's test client needs httpx, and httpx in requirements.txt
+    # would ship a test-only dependency into the production image.
+    from fastapi import HTTPException
+
+    def expect_400(coro):
+        try:
+            asyncio.run(coro)
+        except HTTPException as e:
+            assert e.status_code == 400, f"expected 400, got {e.status_code}"
+            return
+        raise AssertionError("expected HTTPException(400), call succeeded")
 
     fresh_db()
     downloads = os.environ["DOWNLOADS_DIR"]
@@ -724,24 +735,20 @@ def test_p8_translate_subs_rejects_path_traversal():
     job_id = db.insert_job(url="https://example.com/clip", kind="video", status="done")
     db.update_job(job_id, filepath=video, gen_subs="whisper", gen_subs_lang="zh")
 
-    with TestClient(main.app) as client:
-        for bad in ("../../etc/passwd", "someone-elses.srt", "clip.nope.srt", ""):
-            r = client.post(f"/api/jobs/{job_id}/translate-subs",
-                            json={"srt_name": bad, "source_lang": "zh", "target_lang": "en"})
-            assert r.status_code == 400, f"{bad!r} must be rejected, got {r.status_code}"
+    def req(srt_name, source="zh", target="en"):
+        return main.TranslateSubsRequest(srt_name=srt_name, source_lang=source, target_lang=target)
 
-        # Same language in and out is a no-op that would still burn a model
-        # download, and a missing language can't be guessed -- argos has no
-        # detection.
-        r = client.post(f"/api/jobs/{job_id}/translate-subs",
-                        json={"srt_name": "clip.whisper.srt", "source_lang": "zh", "target_lang": "zh"})
-        assert r.status_code == 400
-        r = client.post(f"/api/jobs/{job_id}/translate-subs",
-                        json={"srt_name": "clip.whisper.srt", "source_lang": "", "target_lang": "en"})
-        assert r.status_code == 400
+    for bad in ("../../etc/passwd", "someone-elses.srt", "clip.nope.srt", ""):
+        expect_400(main.api_translate_subs(job_id, req(bad)))
 
-        r = client.get(f"/api/jobs/{job_id}/subs")
-        assert r.json()["subs"] == ["clip.whisper.srt"], "only this job's own sidecars are offered"
+    # Same language in and out is a no-op that would still burn a model
+    # download, and a missing language can't be guessed -- argos has no
+    # detection of its own.
+    expect_400(main.api_translate_subs(job_id, req("clip.whisper.srt", "zh", "zh")))
+    expect_400(main.api_translate_subs(job_id, req("clip.whisper.srt", "", "en")))
+
+    listed = asyncio.run(main.api_list_subs(job_id))
+    assert listed["subs"] == ["clip.whisper.srt"], f"only this job's own sidecars, got {listed['subs']}"
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
