@@ -29,20 +29,20 @@ def fresh_db():
 # --------------------------------------------------------------------- P1
 
 def test_p1_format_presets():
-    # default container is mp4: source streams prefer mp4/m4a first (avoids
-    # landing on webm just because that's what the highest-quality stream
-    # happens to be), falling all the way through to an unrestricted
-    # bv*+ba/b only if nothing mp4-compatible exists.
-    assert worker.build_format("video", "best") == "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
-    assert worker.build_format("video", "1080") == (
-        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]"
+    # H.264 FIRST, by codec not container. [ext=mp4] alone selected AV1
+    # (YouTube serves it inside mp4), which desktop Chrome software-decodes
+    # but iOS Safari refuses outright -- a downloaded library that won't
+    # play on a phone.
+    assert worker.build_format("video", "best") == (
+        "bv*[vcodec^=avc1]+ba[ext=m4a]/b[vcodec^=avc1]"
+        "/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
     )
-    assert worker.build_format("video", "720") == (
-        "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/bv*[height<=720]+ba/b[height<=720]"
-    )
-    assert worker.build_format("video", "480") == (
-        "bv*[height<=480][ext=mp4]+ba[ext=m4a]/b[height<=480][ext=mp4]/bv*[height<=480]+ba/b[height<=480]"
-    )
+    for q in ("1080", "720", "480"):
+        fmt = worker.build_format("video", q)
+        assert fmt.startswith(f"bv*[height<={q}][vcodec^=avc1]+ba[ext=m4a]"), fmt
+        assert f"[height<={q}]" in fmt
+        assert fmt.endswith(f"/bv*[height<={q}]+ba/b[height<={q}]"), "must still fall through to anything"
+        assert fmt.index("vcodec^=avc1") < fmt.index("[ext=mp4]"), "avc1 must be preferred over bare mp4"
     # mkv gets the same mp4/m4a-preferring source selector as mp4 -- mkv
     # accepts any codec, but the point is still to avoid webm when avoidable.
     assert worker.build_format("video", "best", container="mkv") == worker.build_format("video", "best", container="mp4")
@@ -57,7 +57,7 @@ def test_p1_format_presets():
     assert worker.build_format("audio", "1080") == "ba/b"
     assert worker.build_format("audio", "best") == "ba/b"
     assert worker.build_format("audio", "best", container="mkv") == "ba/b"
-    print("ok: format presets, mp4/mkv prefer mp4 sources, webm is opt-in")
+    print("ok: format presets prefer H.264 by codec (not just mp4 container), webm is opt-in")
 
 
 def test_p1_atomic_claim():

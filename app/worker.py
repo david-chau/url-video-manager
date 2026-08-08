@@ -282,15 +282,22 @@ def build_format(kind: str, quality: str, container: str = "mp4") -> str:
 
     container steers *source stream* preference, not just the output file
     extension: on modern YouTube the highest-quality video-only streams are
-    almost always VP9/AV1 in webm, so an unfiltered `bv*+ba/b` selector
-    lands on webm by default regardless of what the merge step is asked to
-    produce. mp4/mkv here both prefer mp4+m4a (h264/aac) source streams
-    first -- those remux cleanly into either container with no re-encode --
-    and only fall through to an unrestricted `bv*+ba/b` (which may well be
-    webm) when nothing mp4-compatible exists at the requested quality.
-    Choosing container='webm' explicitly skips that preference and takes
-    the highest-quality stream outright, same as the old unconditional
-    behavior."""
+    almost always VP9/AV1, so an unfiltered `bv*+ba/b` selector lands on
+    one of those regardless of what the merge step is asked to produce.
+
+    The first choice is H.264 by codec (`vcodec^=avc1`), not by container.
+    Filtering on `[ext=mp4]` alone is not enough and was a real bug:
+    YouTube serves AV1 *inside mp4*, so `[ext=mp4]` happily selected an AV1
+    stream (itag 398), producing a file that plays in desktop Chrome via
+    software decode but is refused outright by iOS Safari, which only
+    decodes AV1 on the newest hardware. H.264 plays everywhere, remuxes
+    into mp4 or mkv with no re-encode, and costs a little efficiency at the
+    same resolution -- the right trade for a library meant to be watched on
+    a phone.
+
+    Falls through to any mp4, then to anything at all, so a video with no
+    H.264 rendition still downloads. container='webm' skips the preference
+    entirely and takes the highest-quality stream outright."""
     if kind == "audio":
         return "ba/b"
     if quality and quality.startswith("fmt:"):
@@ -299,7 +306,13 @@ def build_format(kind: str, quality: str, container: str = "mp4") -> str:
     h = f"[height<={cap}]" if cap else ""
     if container == "webm":
         return f"bv*{h}+ba/b{h}"
-    return f"bv*{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/bv*{h}+ba/b{h}"
+    return (
+        f"bv*{h}[vcodec^=avc1]+ba[ext=m4a]"
+        f"/b{h}[vcodec^=avc1]"
+        f"/bv*{h}[ext=mp4]+ba[ext=m4a]"
+        f"/b{h}[ext=mp4]"
+        f"/bv*{h}+ba/b{h}"
+    )
 
 
 # ------------------------------------------------------------- url classify
