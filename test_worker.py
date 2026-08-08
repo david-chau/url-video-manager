@@ -778,6 +778,26 @@ def test_p9_redownload_keeps_subs_drops_media():
     assert os.path.exists(meta), "and so must their metadata sidecar"
     assert row["status"] == "queued" and row["filepath"] is None
 
+    # Settings can be set in the same call, so a fresh download and its
+    # transcription are one queue pass. Without this, a playlist child
+    # re-downloads with the gen_subs='off' it inherited at expand time and
+    # silently produces no subtitles at all.
+    open(video, "w").close()
+    db.update_job(job_id, filepath=video, status="done", gen_subs="off")
+    row = asyncio.run(main.api_redownload(job_id, main.RegenSubsRequest(
+        gen_subs="whisper", gen_subs_lang="zh", whisper_model="medium", translate_to="en",
+    )))
+    assert row["gen_subs"] == "whisper" and row["gen_subs_lang"] == "zh"
+    assert row["whisper_model"] == "medium" and row["translate_to"] == "en"
+    assert row["status"] == "queued"
+
+    # An unknown model must not survive into the row -- same reason as
+    # everywhere else it's accepted from a client.
+    open(video, "w").close()
+    db.update_job(job_id, filepath=video, status="done")
+    row = asyncio.run(main.api_redownload(job_id, main.RegenSubsRequest(whisper_model="evil/model")))
+    assert row["whisper_model"] is None
+
     # The playlist row itself has nothing to re-download; its children do.
     pl = db.insert_job(url="https://example.com/list", kind="playlist", status="done")
     try:

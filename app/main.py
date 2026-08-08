@@ -443,7 +443,7 @@ async def api_retry(job_id: int):
 
 
 @app.post("/api/jobs/{job_id}/redownload")
-async def api_redownload(job_id: int):
+async def api_redownload(job_id: int, req: RegenSubsRequest | None = None):
     """Discards the downloaded media and queues the job to fetch it again,
     keeping subtitle sidecars.
 
@@ -455,7 +455,13 @@ async def api_redownload(job_id: int):
 
     Subtitles are deliberately kept. They're named against the same stem
     the re-download lands on, so they stay valid, and re-transcribing a
-    season costs hours."""
+    season costs hours.
+
+    An optional body sets the subtitle-generation settings at the same
+    time, so a fresh download and its transcription are one queue pass
+    rather than two manual steps. Without it the job keeps whatever it
+    already had -- which for a playlist child is gen_subs='off' inherited
+    at expand time, i.e. nothing."""
     job = await asyncio.to_thread(db.get_job, job_id)
     if not job:
         raise HTTPException(404, "job not found")
@@ -467,9 +473,29 @@ async def api_redownload(job_id: int):
     if job.get("filepath"):
         removed = await asyncio.to_thread(worker.safe_delete_file, job["filepath"], worker.DOWNLOADS_DIR, True)
         worker.log_line(f"[job {job_id}] redownload: removed {len(removed)} media file(s), subtitles kept")
+
+    settings = {}
+    if req is not None:
+        gen_subs = req.gen_subs if req.gen_subs is not None else (job.get("gen_subs") or "off")
+        gen_subs_lang = req.gen_subs_lang if req.gen_subs_lang is not None else job.get("gen_subs_lang")
+        translate_to = req.translate_to if req.translate_to is not None else job.get("translate_to")
+        ocr_lang = req.ocr_lang if req.ocr_lang is not None else job.get("ocr_lang")
+        ocr_region = req.ocr_region if req.ocr_region is not None else job.get("ocr_region")
+        whisper_model = req.whisper_model if req.whisper_model is not None else job.get("whisper_model")
+        if ocr_region not in worker.OCR_REGIONS:
+            ocr_region = "bottom"
+        if whisper_model not in worker.WHISPER_MODELS:
+            whisper_model = None
+        gen_subs, translate_to = _clamp_gen_subs(job["kind"], gen_subs, gen_subs_lang, translate_to)
+        settings = dict(
+            gen_subs=gen_subs, gen_subs_lang=gen_subs_lang, translate_to=translate_to,
+            ocr_lang=(ocr_lang or "").strip() or None, ocr_region=ocr_region,
+            whisper_model=whisper_model,
+        )
+
     await asyncio.to_thread(
         db.update_job, job_id, status="queued", filepath=None, error=None, progress=0,
-        stage=None, stage_i=None, stage_n=None, speed=None, eta=None,
+        stage=None, stage_i=None, stage_n=None, speed=None, eta=None, **settings,
     )
     return await asyncio.to_thread(db.get_job, job_id)
 
