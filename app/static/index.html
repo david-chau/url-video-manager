@@ -393,6 +393,7 @@
     <div style="margin-top:8px">
       <video id="playerVideo" controls style="width:100%; max-height:70vh; background:#000"></video>
     </div>
+    <pre id="playerError" class="modal-body" style="display:none; margin:8px 0 0; padding:8px; border-radius:4px; font-size:12px; white-space:pre-wrap; color:#b91c1c"></pre>
     <p class="hint" style="margin:6px 0 0">Use the player's CC/subtitles button to pick a track. (Audio-only files play here too -- &lt;audio&gt; elements don't support a caption picker in most browsers, &lt;video&gt; does even with no picture.)</p>
   </div>
 </div>
@@ -891,6 +892,7 @@ jobsBody.addEventListener('click', async (e) => {
         // sees the full track list when it starts loading.
         if (mainUrl) videoEl.src = mainUrl;
         primeSubtitleTracks(videoEl);
+        watchPlaybackErrors(videoEl, id);
         videoEl.play().catch(() => {}); // autoplay can be blocked -- fine, controls are visible
       } catch (err) {
         alert(err.message);
@@ -1067,6 +1069,38 @@ function primeSubtitleTracks(videoEl) {
     videoEl.currentTime = Math.max(0, t - 0.05);
     if (wasPlaying) videoEl.play().catch(() => {});
   });
+}
+
+// A <video> that can't play the file just shows a black box with a
+// crossed-out play button and says nothing -- on iOS especially, where
+// there's no console to check. Surface the MediaError, and pull the real
+// container/codecs off the server, since the usual cause is that the file
+// isn't what its extension claims.
+const MEDIA_ERR = {
+  1: 'playback aborted',
+  2: 'network error while loading',
+  3: 'decode error -- the file is corrupt, or uses a codec this device cannot decode',
+  4: 'source not supported -- this device cannot play this container/codec combination',
+};
+
+function watchPlaybackErrors(videoEl, jobId) {
+  const box = $('#playerError');
+  box.style.display = 'none';
+  box.textContent = '';
+  videoEl.onerror = async () => {
+    const err = videoEl.error;
+    const why = err ? (MEDIA_ERR[err.code] || `code ${err.code}`) : 'unknown error';
+    box.textContent = `Cannot play this file: ${why}${err?.message ? ` (${err.message})` : ''}`;
+    box.style.display = '';
+    // The device says "can't play it"; the server can say what "it" is.
+    try {
+      const info = await api(`/api/jobs/${jobId}/mediainfo`);
+      box.textContent += `\n\nFile: ${info.name}\n${info.summary}`;
+      box.textContent += '\n\niOS/Safari need H.264 video + AAC audio in a real .mp4. Use Re-download if this says otherwise.';
+    } catch (e) {
+      box.textContent += `\n\n(could not read media info: ${e.message})`;
+    }
+  };
 }
 
 function closePlayer() {

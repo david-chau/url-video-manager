@@ -1030,7 +1030,21 @@ def build_mux_cmd(src_path: str, sub_tracks: list[tuple[str, str, str]], out_pat
     """Stream-copy ffmpeg argv: one -i/-map pair per subtitle track.
     copy_all=True maps every stream already in src_path (video jobs, adding
     the merged track alongside subs yt-dlp already embedded); False maps
-    only the audio stream (audio-only outputs, Phase 6b)."""
+    only the audio stream (audio-only outputs, Phase 6b).
+
+    The subtitle codec follows the CONTAINER, and getting this wrong is how
+    an .mp4 ends up not being an mp4: SRT is a Matroska subtitle codec and
+    MP4 can't hold it, so an mp4 output must transcode subtitles to
+    mov_text. (This is why the in-place mux used to write a '.tmp.mkv' and
+    rename it over the .mp4 -- producing a Matroska file with an .mp4
+    name, which Chrome plays and iOS Safari refuses outright.)
+
+    +faststart for mp4 moves the moov atom to the front. Without it a
+    progressive HTTP player has to fetch the end of the file before it can
+    start, which desktop browsers paper over with range requests and iOS
+    often simply fails."""
+    ext = os.path.splitext(out_path)[1].lower()
+    is_mp4 = ext in (".mp4", ".m4v")
     cmd = ["ffmpeg", "-y", "-i", src_path]
     for path, _lang, _title in sub_tracks:
         cmd += ["-i", path]
@@ -1038,7 +1052,9 @@ def build_mux_cmd(src_path: str, sub_tracks: list[tuple[str, str, str]], out_pat
     for i in range(1, len(sub_tracks) + 1):
         cmd += ["-map", str(i)]
     cmd += ["-c", "copy"] if copy_all else ["-c:a", "copy"]
-    cmd += ["-c:s", "srt"]
+    cmd += ["-c:s", "mov_text" if is_mp4 else "srt"]
+    if is_mp4:
+        cmd += ["-movflags", "+faststart"]
     for i, (_path, lang, title) in enumerate(sub_tracks):
         cmd += [f"-metadata:s:s:{i}", f"language={lang}"]
         if title:
@@ -1052,11 +1068,49 @@ def run_mux(src_path: str, sub_tracks: list[tuple[str, str, str]], out_path: str
     src_path (adding a track to an already-muxed video in place) this
     writes to a temp file first and atomically replaces the original."""
     same_file = os.path.abspath(out_path) == os.path.abspath(src_path)
-    tmp_out = out_path + ".tmp.mkv" if same_file else out_path
+    # The temp file MUST keep the real extension. ffmpeg picks its muxer
+    # from the output filename, so a '.tmp.mkv' scratch file produced
+    # Matroska and os.replace then gave it an .mp4 name -- a container lie
+    # that desktop players tolerate and iOS does not.
+    base, ext = os.path.splitext(out_path)
+    tmp_out = f"{base}.tmp{ext}" if same_file else out_path
     cmd = build_mux_cmd(src_path, sub_tracks, tmp_out, copy_all)
     subprocess.run(cmd, check=True, capture_output=True)
     if same_file:
         os.replace(tmp_out, out_path)
+
+
+def probe_media(path: str) -> dict:
+    """ffprobe summary of what a file ACTUALLY is: container, and the codec
+    of each stream. Cheap (reads headers, not the file) and the only honest
+    answer to "why won't this play on my phone" -- the extension is a
+    filename, not a fact, and this project has already shipped a Matroska
+    file called .mp4 once."""
+    cmd = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_entries", "format=format_name,duration:stream=index,codec_type,codec_name,profile",
+        path,
+    ]
+    try:
+        out = subprocess.run(cmd, check=True, capture_output=True, timeout=30).stdout
+        return json.loads(out or b"{}")
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def describe_media(path: str) -> str:
+    """One log-friendly line from probe_media, e.g.
+    'container=mov,mp4,m4a video=h264(High) audio=aac subs=mov_text'."""
+    info = probe_media(path)
+    if "error" in info:
+        return f"probe failed: {info['error']}"
+    parts = [f"container={info.get('format', {}).get('format_name', '?')}"]
+    for st in info.get("streams", []):
+        kind = {"video": "video", "audio": "audio", "subtitle": "subs"}.get(st.get("codec_type"), st.get("codec_type"))
+        name = st.get("codec_name", "?")
+        profile = st.get("profile")
+        parts.append(f"{kind}={name}({profile})" if profile else f"{kind}={name}")
+    return " ".join(parts)
 
 
 def resolve_orig_base(job: dict) -> str:
@@ -2093,6 +2147,9 @@ async def _run_subs_and_mux_stage(
             await asyncio.to_thread(append_job_log, job_id, f"stage: muxing {len(sub_tracks)} subtitle track(s) [{titles}] -> {os.path.basename(out_path)}")
             await asyncio.to_thread(run_mux, current_filepath, sub_tracks, out_path, False)
             db.update_job(job_id, status="done", filepath=out_path, progress=100.0)
+            await asyncio.to_thread(
+                lambda: append_job_log(job_id, f"output: {os.path.basename(out_path)} -- {describe_media(out_path)}"),
+            )
             await asyncio.to_thread(append_job_log, job_id, "stage: done")
             return
     elif job["kind"] == "video":
@@ -2107,10 +2164,17 @@ async def _run_subs_and_mux_stage(
             await asyncio.to_thread(append_job_log, job_id, f"stage: muxing {len(tracks)} subtitle track(s) [{titles}] -> {os.path.basename(current_filepath)}")
             await asyncio.to_thread(run_mux, current_filepath, tracks, current_filepath, True)
             db.update_job(job_id, status="done", progress=100.0)
+            await asyncio.to_thread(
+                lambda: append_job_log(job_id, f"output: {os.path.basename(current_filepath)} -- {describe_media(current_filepath)}"),
+            )
             await asyncio.to_thread(append_job_log, job_id, "stage: done")
             return
 
     db.update_job(job_id, status="done", progress=100.0)
+    if current_filepath:
+        await asyncio.to_thread(
+            lambda: append_job_log(job_id, f"output: {os.path.basename(current_filepath)} -- {describe_media(current_filepath)}"),
+        )
     await asyncio.to_thread(append_job_log, job_id, "stage: done (nothing to mux)")
 
 

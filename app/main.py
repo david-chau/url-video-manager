@@ -442,6 +442,24 @@ async def api_retry(job_id: int):
     return await asyncio.to_thread(db.get_job, job_id)
 
 
+@app.get("/api/jobs/{job_id}/mediainfo")
+async def api_mediainfo(job_id: int):
+    """What the output file actually is, per ffprobe -- container and the
+    codec of every stream. The extension is a filename, not a fact, and
+    "it won't play on my phone" is otherwise unanswerable from the UI."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    path = job.get("filepath")
+    if not path or not os.path.exists(path):
+        raise HTTPException(400, "no downloaded file on disk for this job")
+    return {
+        "name": os.path.basename(path),
+        "summary": await asyncio.to_thread(worker.describe_media, path),
+        "probe": await asyncio.to_thread(worker.probe_media, path),
+    }
+
+
 @app.post("/api/jobs/{job_id}/redownload")
 async def api_redownload(job_id: int, req: RegenSubsRequest | None = None):
     """Discards the downloaded media and queues the job to fetch it again,

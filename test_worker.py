@@ -753,6 +753,38 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p9_mux_container_matches_extension():
+    """An .mp4 must actually BE an mp4. The in-place mux wrote a '.tmp.mkv'
+    and renamed it over the .mp4, producing a Matroska file with an .mp4
+    name -- which desktop browsers play and iOS Safari refuses, the exact
+    'works on my machine, dead on the phone' failure."""
+    subs = [("/tmp/a.srt", "zho", "whisper")]
+
+    mp4 = worker.build_mux_cmd("/tmp/in.mp4", subs, "/tmp/out.mp4", True)
+    assert "mov_text" in mp4, "mp4 cannot carry SRT -- subtitles must be mov_text"
+    assert "srt" not in mp4[mp4.index("-c:s") + 1], mp4
+    assert "+faststart" in mp4, "without faststart the moov atom lands at the end and iOS often won't start"
+
+    mkv = worker.build_mux_cmd("/tmp/in.mkv", subs, "/tmp/out.mkv", True)
+    assert mkv[mkv.index("-c:s") + 1] == "srt", "matroska keeps real SRT"
+    assert "+faststart" not in mkv, "faststart is an mp4 concept"
+
+    # The in-place temp file must keep the real extension, or ffmpeg picks
+    # its muxer from the wrong one -- the original bug.
+    calls = []
+    orig_run = worker.subprocess.run
+    worker.subprocess.run = lambda cmd, **kw: calls.append(cmd) or orig_run(["true"], **kw)
+    orig_replace = worker.os.replace
+    worker.os.replace = lambda a, b: calls.append(("replace", a, b))
+    try:
+        worker.run_mux("/tmp/v.mp4", subs, "/tmp/v.mp4", True)
+    finally:
+        worker.subprocess.run, worker.os.replace = orig_run, orig_replace
+    out_arg = calls[0][-1]
+    assert out_arg.endswith(".mp4"), f"temp output must stay mp4, got {out_arg}"
+    print("ok: mux writes the container the extension promises, with faststart for mp4")
+
+
 def test_p9_redownload_keeps_subs_drops_media():
     """Re-download exists because Retry can't replace a file: yt-dlp skips
     anything already on disk. It must delete the media so the fetch really
