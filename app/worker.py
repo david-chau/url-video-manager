@@ -1654,7 +1654,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
             # other "restart". Sparse on purpose: this is a liveness
             # signal, not a progress bar.
             if now - last_beat >= HEARTBEAT_SECONDS:
-                log_line(f"[job {job_id}] whisper[{task}]: {seg.end:.0f}s/{total:.0f}s, {len(cues)} cues so far")
+                append_job_log(job_id, f"whisper[{task}]: {seg.end:.0f}s/{total:.0f}s, {len(cues)} cues so far")
                 last_beat = now
 
         cues, dropped = drop_hallucinated_cues(cues)
@@ -1800,7 +1800,7 @@ def run_ocr_transcribe(job: dict, video_src: str, out_srt: str) -> dict:
             # Liveness on stdout, same reasoning as the whisper loop above.
             if now - last_beat >= HEARTBEAT_SECONDS:
                 blank_so_far = sum(1 for _t, txt in frame_texts if not txt.strip())
-                log_line(f"[job {job_id}] ocr: frame {i + 1}/{len(frames)}, {blank_so_far} blank so far")
+                append_job_log(job_id, f"ocr: frame {i + 1}/{len(frames)}, {blank_so_far} blank so far")
                 last_beat = now
 
         cues = ocr_frames_to_cues(frame_texts, frame_interval)
@@ -2088,7 +2088,10 @@ async def _run_transcribe_stage(job: dict, orig_base: str, current_filepath: str
     generated, or None if the job ended in error/canceled (already written
     to the DB here, same shape as _run_separation_stage)."""
     job_id = job["id"]
-    db.update_job(job_id, status="transcribing", progress=0)
+    # speed/eta belong to the download stage. Left set, the row reports
+    # "transcribing (whisper) - 23.3MB/s", which is the *download's* last
+    # speed and reads as though the transcription were doing that.
+    db.update_job(job_id, status="transcribing", progress=0, speed=None, eta=None)
     await asyncio.to_thread(
         append_job_log, job_id,
         f"stage: transcribing (engine={job.get('gen_subs')!r} lang_hint={job.get('gen_subs_lang')!r}"
@@ -2111,7 +2114,7 @@ async def _run_separation_stage(job: dict, orig_filepath: str) -> str | None:
     filepath to the DB. Returns the novocals filepath on success, or None
     if the job ended in error/canceled (already written)."""
     job_id = job["id"]
-    db.update_job(job_id, status="separating", progress=0)
+    db.update_job(job_id, status="separating", progress=0, speed=None, eta=None)
     await asyncio.to_thread(append_job_log, job_id, f"stage: separating (model={DEMUCS_MODEL!r})")
     async with SEPARATION_SEM:
         sep_job = {**job, "filepath": orig_filepath}

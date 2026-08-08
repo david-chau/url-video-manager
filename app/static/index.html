@@ -965,8 +965,11 @@ function renderLogModal(j, id) {
   // though progress is ticking. This is the "is it still moving?" answer.
   const title = j?.title || j?.url || `job ${id}`;
   const bits = [];
-  if (j?.status) bits.push(j.status);
+  // stage often already begins with the status ("transcribing (whisper)"),
+  // which rendered as "transcribing transcribing (whisper)".
+  if (j?.status && !(j?.stage || '').startsWith(j.status)) bits.push(j.status);
   if (j?.stage) bits.push(j.stage);
+  else if (j?.status) bits.push(j.status);
   if (typeof j?.progress === 'number' && ACTIVE_STATUSES.includes(j.status)) bits.push(`${j.progress}%`);
   $('#logModalTitle').textContent = bits.length ? `${title} -- ${bits.join(' ')}` : title;
   const parts = [];

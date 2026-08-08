@@ -768,6 +768,32 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p9_transcribe_clears_download_speed():
+    """speed/eta describe the download. Left set, a transcribing row reads
+    "transcribing (whisper) - 23.3MB/s", which looks like the transcription
+    is running at the last download's speed."""
+    fresh_db()
+    job_id = db.insert_job(url="https://example.com/x", kind="video", status="running")
+    db.update_job(job_id, speed="23.3MB/s", eta="00:12", filepath="/nonexistent/x.mp4")
+    job = db.get_job(job_id)
+    assert job["speed"] == "23.3MB/s"
+
+    async def run():
+        # run_transcribe is stubbed out; only the pre-stage DB write matters.
+        orig = worker.run_transcribe
+        worker.run_transcribe = lambda *a, **k: {"status": "error", "error": "stub"}
+        try:
+            await worker._run_transcribe_stage(job, "/nonexistent/x", "/nonexistent/x.mp4")
+        finally:
+            worker.run_transcribe = orig
+
+    asyncio.run(run())
+    row = db.get_job(job_id)
+    assert row["speed"] is None, f"download speed must be cleared, got {row['speed']!r}"
+    assert row["eta"] is None, f"download eta must be cleared, got {row['eta']!r}"
+    print("ok: entering the transcribe stage clears the download's speed/eta")
+
+
 def test_p9_regen_without_mux_leaves_video_untouched():
     """Trying a different model on a finished job must not rewrite the
     video: muxing rewrites the media in place, and the sidecars are usable
