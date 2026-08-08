@@ -705,6 +705,11 @@ function actionsCell(j) {
       // Not gated on gen_subs: an uploaded or downloaded .srt is just as
       // translatable as a whisper-generated one.
       btns.push(`<button data-act="translate-subs" data-id="${j.id}" title="Translate one of this job's existing subtitle files into another language -- no re-transcription.">Translate subs&hellip;</button>`);
+      // Distinct from Retry: yt-dlp skips a file that's already on disk, so
+      // re-running the pipeline can never replace the media. This deletes
+      // it first. Needed when the FILE is the problem, not the processing
+      // -- e.g. an AV1 download that won't play on iOS.
+      btns.push(`<button data-act="redownload" data-id="${j.id}" title="Delete the downloaded video/audio and fetch it again -- subtitles are kept. Use when the file itself is the problem (e.g. a codec your device can't play), not the processing.">Re-download</button>`);
     }
     btns.push(`<button data-act="delete" data-id="${j.id}">Delete</button>`);
   }
@@ -717,6 +722,7 @@ function actionsCell(j) {
     if (kids) {
       btns.push(`<button data-act="gen-subs-playlist" data-id="${j.id}" title="Generate subtitles for all ${kids} downloaded item(s) in this playlist -- no re-download.">Gen subs (${kids})&hellip;</button>`);
       btns.push(`<button data-act="translate-subs-playlist" data-id="${j.id}" title="Translate an existing subtitle track on all ${kids} downloaded item(s) -- no re-transcription.">Translate subs (${kids})&hellip;</button>`);
+      btns.push(`<button data-act="redownload-playlist" data-id="${j.id}" title="Delete and re-fetch the video for all ${kids} downloaded item(s). Subtitles are kept.">Re-download (${kids})</button>`);
     }
   }
   // "this is a playlist, expand it" -- for a watch?v=X&list=Y URL that got
@@ -834,6 +840,28 @@ jobsBody.addEventListener('click', async (e) => {
     if (act === 'translate-subs') {
       await openTranslateModal(Number(id));
       return; // the modal's Translate button does the POST
+    }
+    if (act === 'redownload') {
+      if (!confirm('Delete the downloaded file and fetch it again?\n\nSubtitle files are kept -- only the video/audio is replaced.')) return;
+      await api(`/api/jobs/${id}/redownload`, { method: 'POST' });
+    }
+    if (act === 'redownload-playlist') {
+      const kids = jobs.filter(x => x.parent_id === Number(id) && x.filepath);
+      if (!kids.length) { alert('No downloaded items in this playlist yet.'); return; }
+      if (!confirm(`Delete and re-fetch the video for ${kids.length} item(s)?\n\nSubtitle files are kept -- only the video/audio is replaced.`)) return;
+      const failures = [];
+      for (const k of kids) {
+        try {
+          await api(`/api/jobs/${k.id}/redownload`, { method: 'POST' });
+        } catch (err) {
+          failures.push(`${k.title || `job ${k.id}`}: ${err.message}`);
+        }
+      }
+      if (failures.length) {
+        alert(`${failures.length} of ${kids.length} job(s) could not be queued:\n\n${failures.slice(0, 10).join('\n')}`);
+      }
+      loadJobs();
+      return;
     }
     if (act === 'gen-subs-playlist' || act === 'translate-subs-playlist') {
       const kids = jobs.filter(x => x.parent_id === Number(id) && x.filepath).map(x => x.id);

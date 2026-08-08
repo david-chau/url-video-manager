@@ -753,6 +753,41 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p9_redownload_keeps_subs_drops_media():
+    """Re-download exists because Retry can't replace a file: yt-dlp skips
+    anything already on disk. It must delete the media so the fetch really
+    happens, and must NOT delete subtitles -- those are still valid for the
+    same stem, and re-transcribing a season costs hours."""
+    fresh_db()
+    downloads = os.environ["DOWNLOADS_DIR"]
+    video = os.path.join(downloads, "ep9.mp4")
+    srt = os.path.join(downloads, "ep9.whisper-small.srt")
+    meta = os.path.join(downloads, "ep9.whisper-small.srt.json")
+    part = os.path.join(downloads, "ep9.mp4.part")
+    for p in (video, srt, meta, part):
+        open(p, "w").close()
+
+    job_id = db.insert_job(url="https://example.com/ep9", kind="video", status="done")
+    db.update_job(job_id, filepath=video, gen_subs="whisper")
+
+    row = asyncio.run(main.api_redownload(job_id))
+
+    assert not os.path.exists(video), "the media must go, or yt-dlp skips the re-download"
+    assert not os.path.exists(part), "a stale .part would also be resumed rather than refetched"
+    assert os.path.exists(srt), "subtitles must survive -- they're valid for the same stem"
+    assert os.path.exists(meta), "and so must their metadata sidecar"
+    assert row["status"] == "queued" and row["filepath"] is None
+
+    # The playlist row itself has nothing to re-download; its children do.
+    pl = db.insert_job(url="https://example.com/list", kind="playlist", status="done")
+    try:
+        asyncio.run(main.api_redownload(pl))
+        raise AssertionError("a playlist row must be rejected, not silently no-op")
+    except Exception as e:
+        assert getattr(e, "status_code", None) == 400, e
+    print("ok: re-download removes media and .part, keeps subtitles, rejects playlist rows")
+
+
 def test_p8_hallucinated_credit_cues_dropped():
     """Whisper memorized subtitle-site credits from its training corpus and
     emits them over non-speech audio -- observed here as 'Subtitles brought

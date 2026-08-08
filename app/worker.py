@@ -709,11 +709,20 @@ def request_cancel(job: dict) -> None:
 
 # ------------------------------------------------------------------ delete
 
-def safe_delete_file(filepath: str, downloads_dir: str = DOWNLOADS_DIR) -> list[str]:
+def safe_delete_file(
+    filepath: str, downloads_dir: str = DOWNLOADS_DIR, keep_sidecars: bool = False,
+) -> list[str]:
     """os.path.realpath the stored path and assert it's under downloads_dir
     before unlinking anything -- the path comes out of the DB rather than
     the request, so this is cheap insurance against a corrupted row, not a
-    live hole. Also removes .part/.srt/.vtt siblings."""
+    live hole. Also removes .part/.srt/.vtt siblings.
+
+    keep_sidecars=True removes only the media file and its .part, leaving
+    subtitles alone. That's the re-download case: the point is to replace
+    the video (e.g. an AV1 file that won't play on iOS) while keeping
+    transcripts that took an hour of Whisper to produce and are still
+    perfectly valid -- they're named against the same stem the re-download
+    will land on."""
     if not filepath:
         return []
     real = os.path.realpath(filepath)
@@ -723,14 +732,17 @@ def safe_delete_file(filepath: str, downloads_dir: str = DOWNLOADS_DIR) -> list[
 
     removed = []
     base, _ext = os.path.splitext(real)
-    candidates = {real, real + ".part", base + ".srt"}
-    d, prefix = os.path.dirname(real), os.path.basename(base)
-    try:
-        for name in os.listdir(d):
-            if name.startswith(prefix) and (name.endswith(".srt") or name.endswith(".part") or name.endswith(".vtt")):
-                candidates.add(os.path.join(d, name))
-    except FileNotFoundError:
-        pass
+    if keep_sidecars:
+        candidates = {real, real + ".part"}
+    else:
+        candidates = {real, real + ".part", base + ".srt"}
+        d, prefix = os.path.dirname(real), os.path.basename(base)
+        try:
+            for name in os.listdir(d):
+                if name.startswith(prefix) and (name.endswith(".srt") or name.endswith(".part") or name.endswith(".vtt")):
+                    candidates.add(os.path.join(d, name))
+        except FileNotFoundError:
+            pass
     for c in candidates:
         if os.path.exists(c):
             os.remove(c)

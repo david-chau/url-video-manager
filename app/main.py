@@ -442,6 +442,38 @@ async def api_retry(job_id: int):
     return await asyncio.to_thread(db.get_job, job_id)
 
 
+@app.post("/api/jobs/{job_id}/redownload")
+async def api_redownload(job_id: int):
+    """Discards the downloaded media and queues the job to fetch it again,
+    keeping subtitle sidecars.
+
+    Distinct from Retry, which only re-runs the pipeline: yt-dlp skips a
+    file that's already on disk ("has already been downloaded"), so
+    re-running alone can never replace the media. That matters when the
+    file itself is the problem rather than the processing -- e.g. an AV1
+    download that desktop Chrome plays but iOS refuses.
+
+    Subtitles are deliberately kept. They're named against the same stem
+    the re-download lands on, so they stay valid, and re-transcribing a
+    season costs hours."""
+    job = await asyncio.to_thread(db.get_job, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in TERMINAL_STATUSES:
+        raise HTTPException(400, "job is currently active, cancel it first")
+    if job["kind"] == "playlist":
+        raise HTTPException(400, "re-download the playlist's items, not the playlist row itself")
+
+    if job.get("filepath"):
+        removed = await asyncio.to_thread(worker.safe_delete_file, job["filepath"], worker.DOWNLOADS_DIR, True)
+        worker.log_line(f"[job {job_id}] redownload: removed {len(removed)} media file(s), subtitles kept")
+    await asyncio.to_thread(
+        db.update_job, job_id, status="queued", filepath=None, error=None, progress=0,
+        stage=None, stage_i=None, stage_n=None, speed=None, eta=None,
+    )
+    return await asyncio.to_thread(db.get_job, job_id)
+
+
 @app.delete("/api/jobs/{job_id}")
 async def api_delete_one(job_id: int, file: int = 0):
     job = await asyncio.to_thread(db.get_job, job_id)
