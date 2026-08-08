@@ -149,6 +149,10 @@ class RegenSubsRequest(BaseModel):
     ocr_lang: str | None = None
     ocr_region: str | None = None
     whisper_model: str | None = None
+    # False writes the .srt sidecars and leaves the video file alone.
+    # Muxing rewrites the media in place, which is not what you want when
+    # you're only trying a different model on a file that's already fine.
+    mux: bool = True
 
 
 class TranslateSubsRequest(BaseModel):
@@ -333,7 +337,7 @@ async def api_regen_subs(job_id: int, req: RegenSubsRequest):
         status="transcribing", progress=0, error=None, stage=None,
     )
     updated_job = await asyncio.to_thread(db.get_job, job_id)
-    asyncio.create_task(worker.resume_transcribe(updated_job))
+    asyncio.create_task(worker.resume_transcribe(updated_job, mux=req.mux))
     return updated_job
 
 

@@ -753,6 +753,44 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p9_regen_without_mux_leaves_video_untouched():
+    """Trying a different model on a finished job must not rewrite the
+    video: muxing rewrites the media in place, and the sidecars are usable
+    on their own -- the player and Files list both read them."""
+    fresh_db()
+    downloads = os.environ["DOWNLOADS_DIR"]
+    video = os.path.join(downloads, "ep10.mp4")
+    with open(video, "wb") as f:
+        f.write(b"ORIGINAL-BYTES")
+    before = open(video, "rb").read()
+
+    job_id = db.insert_job(url="https://example.com/ep10", kind="video", status="transcribing")
+    db.update_job(job_id, filepath=video, gen_subs="whisper", gen_subs_lang="zh")
+    job = db.get_job(job_id)
+
+    def fake_whisper(_job, _src, out_srt, task="transcribe"):
+        with open(out_srt, "w", encoding="utf-8") as f:
+            f.write("1\n00:00:01,000 --> 00:00:02,000\n你好\n\n")
+        return {"status": "done", "path": out_srt, "cues": 1, "dropped": 0}
+
+    def no_mux(*_a, **_kw):
+        raise AssertionError("mux=False must not touch the video file")
+
+    orig_whisper, orig_mux = worker.run_whisper_transcribe, worker.run_mux
+    worker.run_whisper_transcribe, worker.run_mux = fake_whisper, no_mux
+    try:
+        asyncio.run(worker.resume_transcribe(job, mux=False))
+    finally:
+        worker.run_whisper_transcribe, worker.run_mux = orig_whisper, orig_mux
+
+    assert open(video, "rb").read() == before, "the video must be byte-for-byte unchanged"
+    row = db.get_job(job_id)
+    assert row["status"] == "done", f"the job still completes, got {row['status']}"
+    assert "left untouched" in (row["log"] or ""), "and says the video wasn't modified"
+    assert os.path.exists(os.path.join(downloads, f"ep10.whisper-{worker.WHISPER_MODEL}.srt"))
+    print("ok: regen with mux=False writes sidecars only, leaving the video byte-for-byte intact")
+
+
 def test_p9_mux_container_matches_extension():
     """An .mp4 must actually BE an mp4. The in-place mux wrote a '.tmp.mkv'
     and renamed it over the .mp4, producing a Matroska file with an .mp4

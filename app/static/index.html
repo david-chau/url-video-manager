@@ -449,6 +449,11 @@
     </div>
     <div class="controls">
       <label>translate to: <input type="text" id="regenTranslateTo" placeholder="en" size="8" list="langCodes"></label>
+    </div>
+    <div class="controls">
+      <label title="Muxing embeds the new track into the video file, rewriting it in place. Uncheck to only write the .srt files and leave the video byte-for-byte untouched -- the player and the Files list pick up sidecars either way, so embedding is a convenience.">
+        <input type="checkbox" id="regenMux" checked> embed into the video file
+      </label>
       <span class="spacer"></span>
       <button id="regenModalRun" class="primary" type="button">Regenerate</button>
     </div>
@@ -1197,6 +1202,10 @@ function openRegenModalBatch(ids, mode = 'regen') {
 
 function applyRegenModeCopy() {
   const redl = regenMode === 'redownload';
+  // Re-download replaces the media anyway, so "leave the video untouched"
+  // is meaningless there -- the video is being rebuilt from scratch.
+  $('#regenMux').closest('label').style.display = redl ? 'none' : '';
+  if (redl) $('#regenMux').checked = true;
   $('#regenModalRun').textContent = redl ? 'Re-download' : 'Regenerate';
   $('#regenModalHint').innerHTML = redl
     ? 'Deletes the downloaded video/audio and fetches it again, then generates subtitles in the same pass. Existing subtitle files are kept.'
@@ -1353,6 +1362,7 @@ $('#regenModalRun').addEventListener('click', async () => {
     ocr_lang: $('#regenOcrLang').value,
     ocr_region: $('#regenOcrRegion').value,
     whisper_model: $('#regenWhisperModel').value,
+    mux: $('#regenMux').checked,
   };
   const endpoint = regenMode === 'redownload' ? 'redownload' : 'regen-subs';
   if (regenMode === 'redownload' &&

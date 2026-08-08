@@ -2230,7 +2230,7 @@ async def resume_separation(job: dict) -> None:
         fail_job(job["id"], e)
 
 
-async def resume_transcribe(job: dict) -> None:
+async def resume_transcribe(job: dict, mux: bool = True) -> None:
     """Startup recovery for a 'transcribing' row whose source file still
     exists on disk: like demucs, Whisper/OCR aren't meaningfully resumable
     mid-run, so this restarts the stage from scratch and continues through
@@ -2240,6 +2240,13 @@ async def resume_transcribe(job: dict) -> None:
     pre-pipeline stem regardless of whether separation already ran, the
     same way resume_separation's caller in main.py resolves it for a job
     stuck earlier in the pipeline.
+    mux=False writes the .srt sidecars and stops there, leaving the video
+    file byte-for-byte untouched. Muxing rewrites the media in place, so
+    without this there is no way to try a different model or language on a
+    finished job without also rewriting a file that was already correct --
+    and the sidecars are individually downloadable and picked up by the
+    player either way, so embedding is a convenience, not a requirement.
+
     # ponytail: the yt-dlp info dict doesn't survive a restart here either,
     # same as resume_separation -- a resumed merge_subs job skips rollup
     # dedup, see that docstring for why.
@@ -2249,6 +2256,14 @@ async def resume_transcribe(job: dict) -> None:
         current_filepath = job["filepath"]
         generated_tracks = await _run_transcribe_stage(job, orig_base, current_filepath)
         if generated_tracks is None:
+            return
+        if not mux:
+            names = ", ".join(os.path.basename(p) for p, _l, _t in generated_tracks)
+            db.update_job(job["id"], status="done", progress=100.0, stage=None)
+            await asyncio.to_thread(
+                append_job_log, job["id"],
+                f"stage: done -- wrote {names} as sidecar(s), video left untouched",
+            )
             return
         await _run_subs_and_mux_stage(job, orig_base, current_filepath, None, generated_tracks)
     except Exception as e:
