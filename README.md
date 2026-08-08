@@ -46,7 +46,7 @@ All settings are environment variables in `docker-compose.yml`:
 | `DEMUCS_MODEL` | `htdemucs` | Demucs model; `mdx_extra_q` is faster/lower quality |
 | `KEEP_VOCALS` | unset | Set `1` to keep the isolated vocal track alongside the instrumental |
 | `AUDIO_FORMAT` | unset | Unset = passthrough (no re-encode); set e.g. `mp3` to force one |
-| `WHISPER_MODEL` | `small` | Default Whisper model size, overridable per job in the UI (`tiny`/`base`/`small`/`medium`/`large-v3`). Each step up is roughly 3× the runtime |
+| `WHISPER_MODEL` | `medium` | Default Whisper model size, overridable per job in the UI (`tiny`/`base`/`small`/`medium`/`large-v3`). Each step up is roughly 3× the runtime; `small` is the faster/lower-quality fallback |
 | `WHISPER_MODEL_DIR` | `/data/whisper-models` | Where the Whisper model is downloaded (persists across restarts) |
 | `OCR_SAMPLE_FPS` | `2` | Frames per second sampled for OCR |
 | `OCR_CROP_BOTTOM_PCT` | `0.22` | Bottom fraction of the frame OCR'd (where hardsubs usually sit) |

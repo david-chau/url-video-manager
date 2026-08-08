@@ -16,7 +16,7 @@ There is a single tag. Whisper and translation used to live behind manual-only `
 
 On CPUs without AVX — common on low-power NAS hardware, e.g. Synology's Celeron models — PyTorch can crash with `Illegal instruction`. That is why Demucs stays optional.
 
-- **Whisper is unaffected.** It runs on ctranslate2, not PyTorch. Verified on a DS920+ (Celeron J4125, no AVX): a 4:24 clip transcribed in 5m22s with `WHISPER_MODEL=small`, roughly 1.2× realtime.
+- **Whisper is unaffected.** It runs on ctranslate2, not PyTorch. Verified on a DS920+ (Celeron J4125, no AVX): a 4:24 clip transcribed in 5m22s with `small`, roughly 1.2× realtime. The default is `medium` (~3× that) because accuracy is the point; drop it per job when throughput matters.
 - **Translation is unverified there.** argos-translate pulls stanza/PyTorch transitively. This app only calls the plain per-cue `translate()` API and never stanza's sentence splitter, so PyTorch may never execute — but that hasn't been tested on non-AVX hardware.
 - **OCR has no restriction.** Plain C, no GPU or AVX dependency.
 
@@ -66,7 +66,7 @@ A writable `HOME` is left alone, and if `/data` isn't usable it declines to move
 
 ## Expectations on NAS hardware
 
-Whisper is CPU-bound: budget roughly realtime per video on a Celeron, serialized by `TRANSCRIBE_SLOTS`. A 34-episode season is an overnight job. Batch actions queue rather than running in parallel, so starting all of them at once is safe — every row shows `transcribing` immediately, but only `TRANSCRIBE_SLOTS` of them are actually running.
+Whisper is CPU-bound: on a Celeron budget roughly realtime per video with `small` and ~3× that with the default `medium`, serialized by `TRANSCRIBE_SLOTS`. Setting `translate_to` doubles it again -- that's a second decode of the same audio, not a text post-process. A 34-episode season at `medium` with translation is a ~17-hour job. Batch actions queue rather than running in parallel, so starting all of them at once is safe — every row shows `transcribing` immediately, but only `TRANSCRIBE_SLOTS` of them are actually running.
 
 ## Logs
 

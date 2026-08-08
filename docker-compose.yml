@@ -28,13 +28,13 @@ services:
       KEEP_VOCALS: ""           # unset = discard the isolated vocal track; set "1" to keep it alongside novocals
       AUDIO_FORMAT: ""          # unset = passthrough (keep source m4a/opus); set "mp3" to force re-encode
       TRANSCRIBE_SLOTS: "1"     # Whisper/OCR are CPU-heavy too; own semaphore, independent of MAX_CONCURRENT/SEPARATION_SLOTS
-      WHISPER_MODEL: "small"    # 'base' is the faster/lower-quality fallback if 'small' is too slow on the Celeron
+      WHISPER_MODEL: "medium"   # default model when a job doesn't pick one; 'small'/'base' are ~3x/~6x faster and noticeably worse. ~15min per 4:24 clip on this NAS, doubled again if translate_to is set
       OCR_SAMPLE_FPS: "2"       # frames/sec sampled for hardsub OCR
       OCR_CROP_BOTTOM_PCT: "0.22"  # bottom fraction of the frame OCR'd (where hardsubs almost always sit)
       OCR_LANG: "chi_sim+chi_tra+eng"  # tesseract '+'-joined lang packs, used when a job has no gen_subs_lang hint -- chi_sim+eng alone (no chi_tra) is confirmed to garble CJK text, see worker.py's OCR_LANG comment
       OCR_BINARIZE: "1"         # per-frame Otsu thresholding before OCR; stylized hardsubs (gradient fill + outline over moving video) are unreadable to tesseract without it. Set "0" to disable if some subtitle style reads worse with it
       TRANSLATE_MODEL_DIR: "/data/argos-models"  # argos-translate language-pair models, downloaded on first use
-      WHISPER_MODEL_DIR: "/data/whisper-models"  # faster-whisper model (~500MB for 'small'), downloaded on first use. Must live on /data: the default cache is under $HOME, which is '/' when `user:` below is set, and a non-root container can't write there
+      WHISPER_MODEL_DIR: "/data/whisper-models"  # faster-whisper models, downloaded on first use (~500MB for 'small', ~1.5GB for 'medium'); each size is fetched once and kept. Must live on /data: the default cache is under $HOME, which is '/' when `user:` below is set, and a non-root container can't write there
       YTDLP_COOKIES: "/data/cookies.txt"
       APP_PASSWORD: ""          # unset by default; set to require HTTP Basic auth on every route
     # On Synology, uncomment and set to your `id <you>` uid:gid (usually the

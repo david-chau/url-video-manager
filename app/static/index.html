@@ -303,7 +303,7 @@
       </label>
       <label title="Whisper model size -- the main accuracy/time tradeoff. Each step up is roughly 3x the runtime: on a NAS Celeron a 4:24 clip takes about 1.5min on tiny, 5min on small, 15min on medium. Models download on first use (75MB for tiny up to ~3GB for large-v3) into /data and are kept, so only the sizes you actually pick cost anything. Ignored when only OCR is running.">whisper model:
         <select id="whisperModel">
-          <option value="">default (small)</option>
+          <option value="">default (medium)</option>
           <option value="tiny">tiny &mdash; fastest, roughest</option>
           <option value="base">base</option>
           <option value="small">small</option>
@@ -417,7 +417,7 @@
       <label>lang hint: <input type="text" id="regenGenSubsLang" placeholder="zh" size="8" list="langCodes"></label>
       <label>whisper model:
         <select id="regenWhisperModel">
-          <option value="">default (small)</option>
+          <option value="">default (medium)</option>
           <option value="tiny">tiny &mdash; fastest, roughest</option>
           <option value="base">base</option>
           <option value="small">small</option>

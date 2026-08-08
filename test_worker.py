@@ -984,7 +984,8 @@ def test_p8_english_target_uses_whisper_translate():
     names = [os.path.basename(p) for p, _l, _t in result["tracks"]]
     # Names carry the model, so a small run and a medium run of the same
     # video coexist instead of the second overwriting the first.
-    assert names == ["ep.whisper-small.srt", "ep.whisper-small.en.srt"], f"both tracks kept, got {names}"
+    slug = f"whisper-{worker.WHISPER_MODEL}"  # derived, so changing the default doesn't break this
+    assert names == [f"ep.{slug}.srt", f"ep.{slug}.en.srt"], f"both tracks kept, got {names}"
     print("ok: an English target uses Whisper's translate task; other targets still route to argos")
 
 
@@ -1023,7 +1024,7 @@ def test_p8_translate_failure_keeps_transcript():
 
     assert result["status"] == "done", f"the transcript succeeded, job must not be {result['status']!r}"
     paths = [os.path.basename(p) for p, _l, _t in result["tracks"]]
-    assert paths == ["ep1.whisper-small.srt"], f"transcript must still be muxed, got {paths}"
+    assert paths == [f"ep1.whisper-{worker.WHISPER_MODEL}.srt"], f"transcript must still be muxed, got {paths}"
     log = db.get_job(job_id)["log"] or ""
     assert "translation skipped" in log and "/.local" in log, "the failure must still be reported, with its cause"
     print("ok: a failed translation keeps and muxes the transcript, reporting the failure in the log")

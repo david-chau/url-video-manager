@@ -172,7 +172,13 @@ TRANSCRIBE_SEM = asyncio.Semaphore(TRANSCRIBE_SLOTS)
 # small/fast fallback if 'small' proves too slow on the Synology's Celeron;
 # see WITH_TRANSCRIBE in the Dockerfile for the gate that makes this usable
 # at all.
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+# 'medium' rather than 'small': measured better on real material here, and
+# accuracy is the point of transcribing at all. Costs roughly 3x the
+# runtime per step up (~15min for a 4:24 clip on the target NAS, doubled
+# again when translate_to is set, since that's a second decode). Drop to
+# 'small' or 'base' per job in the UI, or via this env var, when throughput
+# matters more than accuracy.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
 # Models a job is allowed to request. A whitelist, not passthrough
 # validation: faster-whisper treats an unrecognized name as a Hugging Face
 # repo id and downloads it, so an unchecked string from the client is a
