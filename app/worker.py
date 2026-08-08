@@ -6,6 +6,7 @@ and playlist enumeration go through a real API instead of stdout regex.
 import asyncio
 import contextlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -1419,6 +1420,42 @@ def _watch_model_download(job_id: int, model_name: str):
             append_job_log(job_id, f"whisper: model {model_name!r} downloaded, {grown / 1_000_000:.0f}MB")
 
 
+# Credit lines Whisper memorized from the subtitle corpus it was trained on
+# and emits verbatim over non-speech audio. VAD removes most of the audio
+# that triggers this; these are the ones that still get through, matched on
+# the whole cue so a sentence merely containing the words survives.
+_HALLUCINATED_CUES = re.compile(
+    r"""^\W*(
+        (sub(title)?s?|caption(ing)?)\s*(are|were)?\s*(brought\s+to\s+you\s+)?
+            (by|from|courtesy\s+of|provided\s+by)\b.*
+      | .*\b(amara\.org|opensubtitles|subscene|addic7ed|cdramabase)\b.*
+      | thanks?\s+(you\s+)?for\s+watching.*
+      | (please\s+)?(don't\s+forget\s+to\s+)?(like|subscribe|follow)(\s+and\s+\w+)*[\s!.]*
+      | 字幕(由|组|制作|翻译).*
+      | 请?(不吝)?(点赞|订阅|关注).*
+    )\W*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def drop_hallucinated_cues(
+    cues: list[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float, str]], list[str]]:
+    """Removes memorized-credit cues. Returns (kept, dropped_texts) so the
+    caller can report what went, rather than silently editing a transcript.
+
+    Deliberately conservative: whole-cue matches only. A cue that merely
+    contains "subscribe" inside a real sentence is real dialogue, and
+    dropping actual content is worse than leaving one artifact in."""
+    kept, dropped = [], []
+    for start, end, text in cues:
+        if _HALLUCINATED_CUES.match(text.strip()):
+            dropped.append(text.strip())
+        else:
+            kept.append((start, end, text))
+    return kept, dropped
+
+
 def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task: str = "transcribe") -> dict:
     """Blocking. kind='video' jobs get their audio extracted to a temp mono
     16kHz wav first; kind='audio' jobs transcribe current_filepath directly
@@ -1465,8 +1502,31 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
             model = WhisperModel(
                 model_name, device="cpu", compute_type="int8", download_root=WHISPER_MODEL_DIR,
             )
+        # vad_filter and condition_on_previous_text both exist to suppress
+        # hallucination, which is a different failure from mistranscription
+        # and is not fixed by a bigger model:
+        #
+        # Whisper was trained on scraped subtitle files, so on audio with no
+        # speech in it (music, room tone, silence) it emits the credit lines
+        # it memorized from that corpus -- "Subtitles brought to you by
+        # <site>", "Thanks for watching". Observed here as an English credit
+        # string sitting over Chinese dialogue. A larger model produces
+        # those strings MORE fluently, not less, which is why large-v3 made
+        # no difference. VAD cuts the non-speech spans before they ever
+        # reach the decoder, removing the prompt for it.
+        #
+        # condition_on_previous_text=False stops the other half: with it on,
+        # each window is conditioned on the previous window's text, so one
+        # hallucinated line becomes the context for the next and the model
+        # locks into repeating it for the rest of the file. Off, every
+        # window is judged on its own audio. The cost is slightly less
+        # coherence across sentence boundaries -- worth it.
         segments, info = model.transcribe(
-            audio_src, language=job.get("gen_subs_lang") or None, task=task,
+            audio_src,
+            language=job.get("gen_subs_lang") or None,
+            task=task,
+            vad_filter=True,
+            condition_on_previous_text=False,
         )
         total = info.duration or 0
         # Same reasoning as run_ocr_transcribe's log line -- which model and
@@ -1502,13 +1562,17 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
                 log_line(f"[job {job_id}] whisper[{task}]: {seg.end:.0f}s/{total:.0f}s, {len(cues)} cues so far")
                 last_beat = now
 
+        cues, dropped = drop_hallucinated_cues(cues)
+        if dropped:
+            sample = "; ".join(dropped[:3])
+            append_job_log(job_id, f"whisper[{task}]: dropped {len(dropped)} hallucinated cue(s): {sample}")
         if not cues:
             msg = "whisper produced no cues (silent audio, or an unsupported/mismatched language hint)"
             log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
         write_srt(cues, out_srt)
         append_job_log(job_id, f"whisper[{task}]: {len(cues)} cues -> {os.path.basename(out_srt)}")
-        return {"status": "done", "path": out_srt}
+        return {"status": "done", "path": out_srt, "cues": len(cues), "dropped": len(dropped)}
     except subprocess.CalledProcessError as e:
         msg = f"ffmpeg audio extraction failed: {e}"
         log_line(f"[job {job_id}] ERROR: {msg}")
@@ -1797,6 +1861,34 @@ def _warn_translate_failed(job_id: int, engine: str, err: dict) -> None:
     append_job_log(job_id, msg)
 
 
+def write_track_meta(srt_path: str, meta: dict) -> None:
+    """Writes '<srt>.json' beside a generated subtitle file recording how it
+    was produced.
+
+    The job row only ever holds the CURRENT settings, so a regen overwrites
+    the record of what made the file before it -- which makes comparing two
+    runs impossible exactly when you're trying to decide between them. The
+    sidecar travels with the .srt instead, and survives regeneration
+    because the filename carries the engine and model too.
+
+    Best-effort: a metadata write must never fail a job whose transcript
+    already succeeded."""
+    try:
+        with open(srt_path + ".json", "w", encoding="utf-8") as f:
+            json.dump({"written": _timestamp(), **meta}, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        log_line(f"[track meta] could not write {os.path.basename(srt_path)}.json: {e}")
+
+
+def whisper_track_slug(job: dict, task: str = "transcribe") -> str:
+    """Filename/track segment identifying the engine AND model, e.g.
+    'whisper-medium'. Including the model is what lets a small run and a
+    medium run of the same video coexist -- with a bare '.whisper.srt' the
+    second overwrites the first, so the two can never be compared, which is
+    the entire reason for choosing a model per job."""
+    return f"whisper-{whisper_model_for(job)}"
+
+
 def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
     """Blocking. Runs whichever of whisper/ocr job['gen_subs'] asks for
     ('whisper'|'ocr'|'both') and returns the (path, iso-lang, title) tuples
@@ -1820,11 +1912,18 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
     tracks: list[tuple[str, str, str]] = []
     try:
         if want in ("whisper", "both"):
-            out_srt = f"{orig_base}.whisper.srt"
+            slug = whisper_track_slug(job)
+            out_srt = f"{orig_base}.{slug}.srt"
             result = run_whisper_transcribe(job, current_filepath, out_srt)
             if result["status"] != "done":
                 return result
-            tracks.append((out_srt, iso, "whisper" if lang_hint else "whisper (auto)"))
+            write_track_meta(out_srt, {
+                "engine": "whisper", "task": "transcribe",
+                "model": whisper_model_for(job), "lang_hint": lang_hint,
+                "build": os.environ.get("GIT_SHA", "unknown")[:12],
+                "cues": result.get("cues"), "dropped_hallucinations": result.get("dropped"),
+            })
+            tracks.append((out_srt, iso, slug if lang_hint else f"{slug} (auto)"))
             if target_lang and lang_hint:
                 if job_id in CANCELED:
                     return {"status": "canceled", "error": "canceled by user"}
@@ -1832,16 +1931,23 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
                     # Second decode of the same audio, not a post-process of
                     # the transcript above -- which is the whole point. See
                     # run_whisper_transcribe's docstring.
-                    en_srt = f"{orig_base}.whisper.{target_lang}.srt"
+                    en_srt = f"{orig_base}.{slug}.{target_lang}.srt"
                     result = run_whisper_transcribe(job, current_filepath, en_srt, task="translate")
                     if result["status"] == "canceled":
                         return result
                     if result["status"] != "done":
                         _warn_translate_failed(job_id, "whisper", result)
                     else:
-                        tracks.append((en_srt, iso639_2(target_lang), f"whisper -> {target_lang}"))
+                        write_track_meta(en_srt, {
+                            "engine": "whisper", "task": "translate",
+                            "model": whisper_model_for(job), "lang_hint": lang_hint,
+                            "target_lang": target_lang,
+                            "build": os.environ.get("GIT_SHA", "unknown")[:12],
+                            "cues": result.get("cues"), "dropped_hallucinations": result.get("dropped"),
+                        })
+                        tracks.append((en_srt, iso639_2(target_lang), f"{slug} -> {target_lang}"))
                 else:
-                    err = _add_translated_track(job, orig_base, out_srt, "whisper", lang_hint, target_lang, tracks)
+                    err = _add_translated_track(job, orig_base, out_srt, slug, lang_hint, target_lang, tracks)
                     if err is not None:
                         if err.get("status") == "canceled":
                             return err
@@ -1855,6 +1961,13 @@ def run_transcribe(job: dict, current_filepath: str, orig_base: str) -> dict:
             result = run_ocr_transcribe(job, current_filepath, out_srt)
             if result["status"] != "done":
                 return result
+            write_track_meta(out_srt, {
+                "engine": "ocr", "lang": ocr_lang_for(lang_hint, job.get("ocr_lang")),
+                "region": job.get("ocr_region") or "bottom",
+                "sample_fps": OCR_SAMPLE_FPS, "binarize": OCR_BINARIZE,
+                "crop_bottom_pct": OCR_CROP_BOTTOM_PCT,
+                "build": os.environ.get("GIT_SHA", "unknown")[:12],
+            })
             tracks.append((out_srt, iso, "ocr" if lang_hint else "ocr (auto)"))
             if target_lang and lang_hint:
                 if job_id in CANCELED:

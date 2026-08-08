@@ -753,6 +753,61 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p8_hallucinated_credit_cues_dropped():
+    """Whisper memorized subtitle-site credits from its training corpus and
+    emits them over non-speech audio -- observed here as 'Subtitles brought
+    to you by CdramaBase' sitting on top of Chinese dialogue. A bigger model
+    produces them more fluently, not less, so this is filtered, not tuned."""
+    cues = [
+        (0.0, 2.0, "Subtitles brought to you by CdramaBase"),
+        (2.0, 4.0, "想想还有点小激动呢"),
+        (4.0, 6.0, "Subtitles by the Amara.org community"),
+        (6.0, 8.0, "Thanks for watching!"),
+        (8.0, 10.0, "字幕由中文字幕组制作"),
+        (10.0, 12.0, "Please subscribe"),
+        (12.0, 14.0, "I subscribe to that newspaper every morning"),
+        (14.0, 16.0, "He thanked me for watching his dog"),
+    ]
+    kept, dropped = worker.drop_hallucinated_cues(cues)
+    kept_text = [t for _s, _e, t in kept]
+    assert "想想还有点小激动呢" in kept_text, "real dialogue must survive"
+    # Whole-cue matching only: real sentences that merely contain the
+    # trigger words are dialogue, and dropping content is worse than
+    # leaving one artifact behind.
+    assert "I subscribe to that newspaper every morning" in kept_text
+    assert "He thanked me for watching his dog" in kept_text
+    assert len(dropped) == 5, f"expected the 5 credit lines dropped, got {dropped}"
+    assert len(kept) == 3
+    print("ok: memorized credit cues dropped, real dialogue containing the same words kept")
+
+
+def test_p8_track_meta_records_how_it_was_made():
+    """The job row only holds CURRENT settings, so a regen destroys the
+    record of what produced the previous file -- exactly when comparing two
+    models is the point. Metadata travels with the .srt instead."""
+    import json as _json
+    import shutil
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        srt = os.path.join(d, "ep.whisper-medium.srt")
+        open(srt, "w").close()
+        worker.write_track_meta(srt, {"engine": "whisper", "model": "medium", "cues": 129})
+        meta = _json.load(open(srt + ".json", encoding="utf-8"))
+        assert meta["model"] == "medium" and meta["cues"] == 129
+        assert "written" in meta, "a timestamp is what makes two runs comparable after the fact"
+
+        # Model in the filename is what lets two runs coexist at all.
+        assert worker.whisper_track_slug({"whisper_model": "medium"}) == "whisper-medium"
+        assert worker.whisper_track_slug({}) == f"whisper-{worker.WHISPER_MODEL}"
+
+        # An unwritable path must not fail a job whose transcript succeeded.
+        worker.write_track_meta("/proc/nope/x.srt", {"engine": "whisper"})
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("ok: per-track metadata sidecar records engine/model, and never fails the job")
+
+
 def test_p8_whisper_model_is_whitelisted():
     """The model name reaches WhisperModel(), which treats anything it
     doesn't recognize as a Hugging Face repo id and downloads it -- so an
@@ -840,7 +895,9 @@ def test_p8_english_target_uses_whisper_translate():
 
     assert calls == ["transcribe", "translate"], f"one pass each, got {calls}"
     names = [os.path.basename(p) for p, _l, _t in result["tracks"]]
-    assert names == ["ep.whisper.srt", "ep.whisper.en.srt"], f"both tracks kept, got {names}"
+    # Names carry the model, so a small run and a medium run of the same
+    # video coexist instead of the second overwriting the first.
+    assert names == ["ep.whisper-small.srt", "ep.whisper-small.en.srt"], f"both tracks kept, got {names}"
     print("ok: an English target uses Whisper's translate task; other targets still route to argos")
 
 
@@ -879,7 +936,7 @@ def test_p8_translate_failure_keeps_transcript():
 
     assert result["status"] == "done", f"the transcript succeeded, job must not be {result['status']!r}"
     paths = [os.path.basename(p) for p, _l, _t in result["tracks"]]
-    assert paths == ["ep1.whisper.srt"], f"transcript must still be muxed, got {paths}"
+    assert paths == ["ep1.whisper-small.srt"], f"transcript must still be muxed, got {paths}"
     log = db.get_job(job_id)["log"] or ""
     assert "translation skipped" in log and "/.local" in log, "the failure must still be reported, with its cause"
     print("ok: a failed translation keeps and muxes the transcript, reporting the failure in the log")

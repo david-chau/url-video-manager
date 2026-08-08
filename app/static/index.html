@@ -869,21 +869,12 @@ jobsBody.addEventListener('click', async (e) => {
           track.kind = 'subtitles';
           track.label = label;
           track.src = `/api/jobs/${id}/vtt/${encodeURIComponent(f.name)}`;
-          // A track whose VTT finishes loading after playback started only
-          // begins activating cues from that moment -- any cue whose window
-          // already passed never fires, so the captions read as mistimed
-          // until you toggle the track off and on, which forces the browser
-          // to rebuild the active-cue list. Nudging currentTime does the
-          // same rebuild without the manual toggle.
-          track.addEventListener('load', () => {
-            if (!videoEl.paused || videoEl.currentTime > 0) videoEl.currentTime = videoEl.currentTime;
-          });
           videoEl.appendChild(track);
         }
-        // src LAST, after every <track> is in the DOM. Setting it first
-        // started the media loading while tracks were still being appended,
-        // which is what put them out of sync in the first place.
+        // src LAST, after every <track> is in the DOM, so the media element
+        // sees the full track list when it starts loading.
         if (mainUrl) videoEl.src = mainUrl;
+        primeSubtitleTracks(videoEl);
         videoEl.play().catch(() => {}); // autoplay can be blocked -- fine, controls are visible
       } catch (err) {
         alert(err.message);
@@ -1022,12 +1013,52 @@ $('#logModal').addEventListener('click', (e) => { if (e.target.id === 'logModal'
 $('#filesModalClose').addEventListener('click', () => { $('#filesModal').style.display = 'none'; });
 $('#filesModal').addEventListener('click', (e) => { if (e.target.id === 'filesModal') $('#filesModal').style.display = 'none'; });
 
+// Subtitle tracks are lazy in every browser: a <track> stays unfetched
+// while its mode is 'disabled', which is the default. Picking one from the
+// CC menu mid-playback therefore starts a network fetch, and the parsed
+// cues only begin being evaluated from whatever time the video has reached
+// by the time they land -- so the first cue shown is whichever one happens
+// to start next, and everything reads as mistimed until you toggle the
+// track off and on, which is what forces a fresh active-cue computation.
+//
+// Two halves to fixing it, and it needs both:
+//   1. Fetch and parse every track up front by putting it in 'hidden'
+//      mode, which loads cues without displaying them. By the time the CC
+//      menu is used, there is nothing left to load.
+//   2. On selection, force the UA to recompute which cues are active. A
+//      real seek is required -- assigning currentTime its own value is a
+//      no-op in Chrome and does nothing, which is why the first attempt at
+//      this didn't work.
+function primeSubtitleTracks(videoEl) {
+  const prime = () => {
+    for (const t of videoEl.textTracks) {
+      if (t.mode === 'disabled') t.mode = 'hidden';
+    }
+  };
+  prime();
+  videoEl.addEventListener('loadedmetadata', prime, { once: true });
+
+  // The element is reused across opens, so guard against stacking listeners.
+  if (videoEl.dataset.cueSyncBound) return;
+  videoEl.dataset.cueSyncBound = '1';
+  videoEl.textTracks.addEventListener('change', () => {
+    const t = videoEl.currentTime;
+    if (t <= 0) return; // nothing has passed yet, cues will fire naturally
+    const wasPlaying = !videoEl.paused;
+    // Seek a hair backwards, then restore: enough to force the active-cue
+    // list to be rebuilt at the current position, small enough not to be
+    // perceptible.
+    videoEl.currentTime = Math.max(0, t - 0.05);
+    if (wasPlaying) videoEl.play().catch(() => {});
+  });
+}
+
 function closePlayer() {
   $('#playerModal').style.display = 'none';
   const v = $('#playerVideo');
   v.pause();
   v.removeAttribute('src');
-  v.innerHTML = '';
+  v.innerHTML = ''; // drops the <track> elements; the textTracks listener is on the element itself and survives
   v.load(); // release the media resource, don't leave it buffering in the background
 }
 $('#playerModalClose').addEventListener('click', closePlayer);
