@@ -11,10 +11,59 @@
 ## Job lifecycle
 
 ```
+                        ┌──────────────┐
+   paste URL(s) ───────▶│  jobs table  │◀── SSE polls this for the UI
+                        │   (SQLite)   │
+                        └──────┬───────┘
+                               │ claim_next_job()  (atomic, DOWNLOAD_SEM)
+                               ▼
+                        ┌──────────────┐
+                        │   download   │  yt-dlp · prefers H.264
+                        │   'running'  │  → <title> [<id>].mp4
+                        └──────┬───────┘
+                               │
+                  strip_vocals?│
+                               ▼
+                        ┌──────────────┐
+                        │   separate   │  demucs        SEPARATION_SEM
+                        │ 'separating' │  → …_novocals
+                        └──────┬───────┘
+                               │
+                     gen_subs? │
+                               ▼
+        ┌──────────────────────────────────────────────┐
+        │              transcribe                      │ TRANSCRIBE_SEM
+        │             'transcribing'                   │
+        │                                              │
+        │   whisper ──────────▶ …whisper-<model>.srt   │
+        │     │  audio                                 │
+        │     └─ task=translate ▶ …whisper-<model>.en.srt
+        │                                              │
+        │   ocr ──────────────▶ …ocr.srt               │
+        │     │  frames → Otsu → tesseract             │
+        │     └─ argos ────────▶ …ocr.<lang>.srt       │
+        └──────────────────────┬───────────────────────┘
+                               │  (path, iso-lang, title) tuples
+                     embed?    │  ── no ──▶ sidecars only, media untouched
+                               ▼
+                        ┌──────────────┐
+                        │     mux      │  ffmpeg -c copy
+                        │   'muxing'   │  mp4 → mov_text +faststart
+                        └──────┬───────┘  mkv → srt
+                               ▼
+                            'done'
+```
+
+Written as a state machine:
+
+```
 queued → running → [separating] → [transcribing] → [muxing] → done
+                        └──────────────┴───────────────┴──────▶ error / canceled
 ```
 
 `error` and `canceled` are terminal states reachable from any point. Bracketed stages run only if the job asked for them.
+
+Every arrow out of a stage is also a resume point: `filepath` and `status` are in the DB, so a restart mid-pipeline re-enters at the stage that was running rather than at the top.
 
 Every stage writes progress to SQLite rather than only to an in-memory socket, so a page refresh or container restart never loses state. Interrupted jobs resume from whichever stage they were in, without re-downloading — `resume_separation` and `resume_transcribe` restart that stage from scratch (neither Demucs nor Whisper is meaningfully resumable mid-run) and continue through the same mux stage a fresh job would hit.
 
@@ -39,11 +88,21 @@ These are properties the code currently has, each one the result of a bug that v
 Sidecars are named against the job's *pre-pipeline* stem, whatever stages ran:
 
 ```
-<title> [<id>].whisper.srt        generated
-<title> [<id>].ocr.srt            generated
-<title> [<id>].whisper.en.srt     translated from the whisper track
-<title> [<id>].zh-en.srt          bilingual merge
+<title> [<id>].mp4                       the media
+<title> [<id>].whisper-medium.srt        generated (model in the name)
+<title> [<id>].whisper-medium.srt.json   how it was made
+<title> [<id>].whisper-medium.en.srt     whisper's own translate task
+<title> [<id>].ocr.srt                   generated from frames
+<title> [<id>].ocr.en.srt                argos-translated from the OCR text
+<title> [<id>].zh-en.srt                 bilingual merge
 ```
+
+The model is in the filename so two runs can coexist: with a bare
+`.whisper.srt`, regenerating at a different size silently overwrote the
+previous transcript, which made the whole point of choosing a model per
+job — comparing them — impossible. The `.json` sidecar records engine,
+model, task, language hint, cue count and build SHA, because the job row
+only ever holds the *current* settings.
 
 `resolve_orig_base()` recovers that stem from the current filepath without a DB column, since only this app's own transformations change it (Demucs appends `_novocals`; muxing changes the extension or replaces the file in place). The frontend mirrors this in `srtSuffix()` to address a track kind across a whole playlist, where no single filename applies.
 

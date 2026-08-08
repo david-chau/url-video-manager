@@ -1054,20 +1054,30 @@ $('#filesModal').addEventListener('click', (e) => { if (e.target.id === 'filesMo
 //      real seek is required -- assigning currentTime its own value is a
 //      no-op in Chrome and does nothing, which is why the first attempt at
 //      this didn't work.
-// The raw filename suffix ('whisper-medium', 'whisper-medium.en') is too
-// long for a native CC menu, which truncates it -- and both whisper tracks
-// then render as the identical "whisper-me...", so the list can't be used
-// to pick between them. Language is the thing being chosen, so it leads,
-// and the model is dropped: it's recorded in the filename and the .json
-// sidecar, neither of which is a subtitle menu.
+// Native CC menus truncate at roughly nine characters, so a label has to
+// be genuinely short, not merely shorter: "whisper-medium" became
+// "whisper-me...", and the first fix, "en (whisper)", became "en (whis...".
+// Both left two tracks looking identical, which is the one thing the menu
+// exists to prevent.
+//
+// So: language first (that's what's being chosen), then a terse tag that
+// keeps tracks distinct -- 'ocr', or an abbreviated model for whisper.
+// "zh med" fits; "zh (whisper-medium)" never will. The full name is one
+// click away in Files, and in the .json sidecar.
 function trackLabel(job, suffix) {
   const parts = suffix.split('.');
-  const engine = parts[0].split('-')[0]; // 'whisper-medium' -> 'whisper'
-  if (engine !== 'whisper' && engine !== 'ocr') return suffix; // merged/uploaded tracks keep their own name
+  const head = parts[0];                 // 'whisper-medium' | 'ocr' | 'zh-en'
+  const engine = head.split('-')[0];
+  if (engine !== 'whisper' && engine !== 'ocr') return suffix; // merged/uploaded keep their own name
   // A trailing '.xx' is a translation target; otherwise it's the source
   // language, which only the job knows.
   const lang = parts.length > 1 ? parts[parts.length - 1] : (job?.gen_subs_lang || '');
-  return lang ? `${lang} (${engine})` : engine;
+  const model = head.includes('-') ? head.slice(head.indexOf('-') + 1) : '';
+  // Tagged unconditionally rather than only on collision: several models
+  // and both engines routinely coexist for one video (each regen adds a
+  // file), so an untagged label is one regen away from being ambiguous.
+  const tag = engine === 'ocr' ? 'ocr' : (model ? model.slice(0, 3) : 'whisper');
+  return lang ? `${lang} ${tag}` : tag;
 }
 
 function primeSubtitleTracks(videoEl) {
