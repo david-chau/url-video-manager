@@ -1309,6 +1309,28 @@ def binarize_for_ocr(img):
 # A subtitle that outlives its speech by more than this is reporting a bad
 # end timestamp, not a long silence being deliberately captioned.
 MAX_CUE_SECONDS = float(os.environ.get("MAX_CUE_SECONDS", "12"))
+# Held briefly past the last word, so a line doesn't vanish on the syllable.
+CUE_TAIL_SECONDS = float(os.environ.get("CUE_TAIL_SECONDS", "0.4"))
+# ...and never shown so briefly it can't be read, subject to the next line.
+MIN_CUE_SECONDS = float(os.environ.get("MIN_CUE_SECONDS", "0.9"))
+
+
+def speech_end(seg) -> float:
+    """When this segment's speech actually stops.
+
+    Whisper's segment.end marks where the segment was cut, which for
+    contiguous speech is simply where the next segment starts -- so using
+    it directly leaves every line on screen until the next person talks.
+    The last word's end timestamp is the real answer; segment.end is the
+    fallback when word alignment isn't available (older faster-whisper, or
+    a segment that produced no words)."""
+    words = getattr(seg, "words", None)
+    if not words:
+        return seg.end
+    last = max((w.end for w in words if getattr(w, "end", None) is not None), default=None)
+    if last is None:
+        return seg.end
+    return min(seg.end, last + CUE_TAIL_SECONDS)
 
 
 def write_srt(cues: list[tuple[float, float, str]], path: str) -> int:
@@ -1341,6 +1363,11 @@ def write_srt(cues: list[tuple[float, float, str]], path: str) -> int:
         if end > limit:
             end = limit
             fixed += 1
+        # Trimming to the last word can leave a very short cue; stretch it
+        # back out to something readable, but never into the next line.
+        floor = min(start + MIN_CUE_SECONDS, next_start) if next_start is not None else start + MIN_CUE_SECONDS
+        if end < floor:
+            end = floor
         if end <= start:
             end = start + 0.1  # a zero/negative-length cue never renders at all
         out.append(pysrt.SubRipItem(
@@ -1648,12 +1675,21 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
         # locks into repeating it for the rest of the file. Off, every
         # window is judged on its own audio. The cost is slightly less
         # coherence across sentence boundaries -- worth it.
+        # word_timestamps=True is what makes a cue end when the SPEECH ends.
+        # Whisper's segment.end is a segment boundary, not the end of the
+        # utterance: measured on a real transcript, 83 of 107 cues ended at
+        # the exact millisecond the next one began, so every line sat on
+        # screen through the silence after it -- one 2-second line held for
+        # 15.9s. Clamping can't fix that, because the timestamps aren't
+        # overlapping, they're tiling. The word alignment gives a real
+        # end-of-speech to trim back to. It costs an extra alignment pass.
         segments, info = model.transcribe(
             audio_src,
             language=job.get("gen_subs_lang") or None,
             task=task,
             vad_filter=True,
             condition_on_previous_text=False,
+            word_timestamps=True,
         )
         total = info.duration or 0
         # Same reasoning as run_ocr_transcribe's log line -- which model and
@@ -1673,7 +1709,7 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
                 return {"status": "canceled", "error": "canceled by user"}
             text = seg.text.strip()
             if text:
-                cues.append((seg.start, seg.end, text))
+                cues.append((seg.start, speech_end(seg), text))
             now = time.monotonic()
             if now - last_flush >= 1.0:
                 pct = min(100.0, seg.end / total * 100.0) if total else 0.0

@@ -769,6 +769,47 @@ def test_p8_translate_subs_rejects_path_traversal():
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
 
 
+def test_p9_cue_ends_at_last_word_not_segment_boundary():
+    """Measured on a real transcript: 83 of 107 cues ended at the exact
+    millisecond the next began, because Whisper's segment.end is where the
+    segment was CUT, not where speech stopped. One 2-second line was held
+    15.9s. The timestamps tile rather than overlap, so clamping can't help
+    -- only the word alignment knows when the talking actually ended."""
+    class W:
+        def __init__(self, end): self.end = end
+
+    class Seg:
+        def __init__(self, start, end, words=None):
+            self.start, self.end, self.words = start, end, words
+
+    # Speech ends at 4.0 but the segment runs to the next line at 20.0.
+    trimmed = worker.speech_end(Seg(2.0, 20.0, [W(3.0), W(4.0)]))
+    assert trimmed == 4.0 + worker.CUE_TAIL_SECONDS, trimmed
+    assert trimmed < 20.0, "the whole point: the cue must not run to the segment boundary"
+
+    # Never extended beyond segment.end by the tail padding.
+    assert worker.speech_end(Seg(0.0, 5.0, [W(4.9)])) == 5.0
+
+    # No word alignment available -> fall back rather than invent a time.
+    assert worker.speech_end(Seg(0.0, 9.0, None)) == 9.0
+    assert worker.speech_end(Seg(0.0, 9.0, [])) == 9.0
+
+    # A trimmed cue that lands too short is stretched back to readable,
+    # but not into the next line.
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        p = os.path.join(d, "t.srt")
+        worker.write_srt([(0.0, 0.2, "Hi"), (0.6, 3.0, "There")], p)
+        subs = pysrt.open(p)
+        assert subs[0].end.ordinal == 600, f"stretched only up to the next cue, got {subs[0].end}"
+        worker.write_srt([(0.0, 0.2, "Hi"), (30.0, 33.0, "Later")], p)
+        assert pysrt.open(p)[0].end.ordinal == int(worker.MIN_CUE_SECONDS * 1000)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("ok: cues end at the last word, padded, floored for readability, never into the next line")
+
+
 def test_p9_cues_do_not_outlive_the_next_line():
     """A cue whose end runs to the next line's start sits on screen through
     the silence between them -- "Hello" still showing ten minutes later,
