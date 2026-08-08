@@ -879,14 +879,13 @@ jobsBody.addEventListener('click', async (e) => {
       try {
         const { files } = await api(`/api/jobs/${id}/files`);
         const mainUrl = fileUrl(j?.filepath);
-        // Label tracks by stripping the shared filename stem -- "Title
-        // [id].zh-en.srt" -> "zh-en", "Title [id].ocr.en.srt" -> "ocr.en".
         const mainBase = j?.filepath ? j.filepath.split('/').pop().replace(/\.[^.]+$/, '') : null;
         for (const f of files) {
           if (!f.name.endsWith('.srt')) continue;
-          const label = (mainBase && f.name.startsWith(mainBase + '.'))
+          const suffix = (mainBase && f.name.startsWith(mainBase + '.'))
             ? f.name.slice(mainBase.length + 1, -4)
             : f.name;
+          const label = trackLabel(j, suffix);
           const track = document.createElement('track');
           track.kind = 'subtitles';
           track.label = label;
@@ -1055,11 +1054,32 @@ $('#filesModal').addEventListener('click', (e) => { if (e.target.id === 'filesMo
 //      real seek is required -- assigning currentTime its own value is a
 //      no-op in Chrome and does nothing, which is why the first attempt at
 //      this didn't work.
+// The raw filename suffix ('whisper-medium', 'whisper-medium.en') is too
+// long for a native CC menu, which truncates it -- and both whisper tracks
+// then render as the identical "whisper-me...", so the list can't be used
+// to pick between them. Language is the thing being chosen, so it leads,
+// and the model is dropped: it's recorded in the filename and the .json
+// sidecar, neither of which is a subtitle menu.
+function trackLabel(job, suffix) {
+  const parts = suffix.split('.');
+  const engine = parts[0].split('-')[0]; // 'whisper-medium' -> 'whisper'
+  if (engine !== 'whisper' && engine !== 'ocr') return suffix; // merged/uploaded tracks keep their own name
+  // A trailing '.xx' is a translation target; otherwise it's the source
+  // language, which only the job knows.
+  const lang = parts.length > 1 ? parts[parts.length - 1] : (job?.gen_subs_lang || '');
+  return lang ? `${lang} (${engine})` : engine;
+}
+
 function primeSubtitleTracks(videoEl) {
+  // 'hidden' for ALL of them, not just the disabled ones: hidden loads the
+  // cues (which is the point of priming) without displaying them, and
+  // forcing it also switches off any track the user agent turned on by
+  // itself. iOS auto-enables a text track when system captions are on, so
+  // a caption would appear without ever being chosen -- and with several
+  // whisper tracks present, not necessarily the wanted one. Nothing shows
+  // until it's picked from the CC menu.
   const prime = () => {
-    for (const t of videoEl.textTracks) {
-      if (t.mode === 'disabled') t.mode = 'hidden';
-    }
+    for (const t of videoEl.textTracks) t.mode = 'hidden';
   };
   prime();
   videoEl.addEventListener('loadedmetadata', prime, { once: true });

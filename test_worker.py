@@ -4,6 +4,7 @@ Run: python3 test_worker.py
 """
 import asyncio
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -766,6 +767,42 @@ def test_p8_translate_subs_rejects_path_traversal():
     listed = asyncio.run(main.api_list_subs(job_id))
     assert listed["subs"] == ["clip.whisper.srt"], f"only this job's own sidecars, got {listed['subs']}"
     print("ok: translate-subs rejects traversal/foreign/missing srt names and degenerate language pairs")
+
+
+def test_p9_cues_do_not_outlive_the_next_line():
+    """A cue whose end runs to the next line's start sits on screen through
+    the silence between them -- "Hello" still showing ten minutes later,
+    which is the player faithfully rendering a bad end timestamp."""
+    import tempfile
+    d = tempfile.mkdtemp()
+    try:
+        p = os.path.join(d, "t.srt")
+        fixed = worker.write_srt([
+            (0.0, 600.0, "Hello"),      # claims to last until the next line
+            (600.0, 605.0, "Hi"),
+        ], p)
+        assert fixed == 1, f"the overlong cue must be corrected, got {fixed}"
+        subs = pysrt.open(p)
+        assert subs[0].end.ordinal <= subs[1].start.ordinal, "no cue may outlive the next one's start"
+        assert subs[0].end.ordinal <= 12_000, "and is capped at MAX_CUE_SECONDS regardless"
+
+        # The same failure with nothing after it -- no next cue to clamp
+        # against, so only the cap applies.
+        assert worker.write_srt([(0.0, 900.0, "Trailing")], p) == 1
+        assert pysrt.open(p)[0].end.ordinal <= 12_000
+
+        # Honest timings are left exactly alone.
+        assert worker.write_srt([(0.0, 4.5, "A"), (10.0, 12.0, "B")], p) == 0
+        subs = pysrt.open(p)
+        assert subs[0].end.ordinal == 4500 and subs[1].end.ordinal == 12000
+
+        # Out-of-order input is sorted first, or "the next cue" is meaningless.
+        worker.write_srt([(10.0, 11.0, "second"), (0.0, 99.0, "first")], p)
+        subs = pysrt.open(p)
+        assert subs[0].text == "first" and subs[0].end.ordinal <= 10_000
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    print("ok: cue ends are clamped to the next line and capped, honest timings untouched")
 
 
 def test_p9_transcribe_clears_download_speed():

@@ -1306,19 +1306,51 @@ def binarize_for_ocr(img):
     return bw
 
 
-def write_srt(cues: list[tuple[float, float, str]], path: str) -> None:
-    """cues: (start_seconds, end_seconds, text). Shared by both the Whisper
-    and OCR pipelines so SRT timestamp formatting (HH:MM:SS,mmm) and index
-    numbering aren't written twice."""
+# A subtitle that outlives its speech by more than this is reporting a bad
+# end timestamp, not a long silence being deliberately captioned.
+MAX_CUE_SECONDS = float(os.environ.get("MAX_CUE_SECONDS", "12"))
+
+
+def write_srt(cues: list[tuple[float, float, str]], path: str) -> int:
+    """cues: (start_seconds, end_seconds, text). Shared by the Whisper, OCR
+    and translation pipelines so SRT timestamp formatting (HH:MM:SS,mmm) and
+    index numbering aren't written three times. Returns how many cue ends
+    had to be corrected.
+
+    Two corrections, both about cues that overstay:
+
+    A cue must never outlive the next cue's start. Whisper can report an
+    end timestamp that runs to the beginning of the next speech rather than
+    to the end of this utterance -- VAD makes it likelier, since segment
+    ends get mapped back from a chunked timeline -- and the player is doing
+    exactly what it's told when the line then sits on screen through the
+    silence.
+
+    And an end that overshoots by more than MAX_CUE_SECONDS is capped even
+    when nothing follows it, which is the same failure at the end of a
+    file, where there's no next cue to clamp against.
+
+    Sorted first: clamping against "the next cue" is only meaningful in
+    time order, and nothing upstream guarantees it."""
+    ordered = sorted(cues, key=lambda c: (c[0], c[1]))
+    fixed = 0
     out = pysrt.SubRipFile()
-    for i, (start, end, text) in enumerate(cues, start=1):
+    for i, (start, end, text) in enumerate(ordered):
+        next_start = ordered[i + 1][0] if i + 1 < len(ordered) else None
+        limit = min(x for x in (next_start, start + MAX_CUE_SECONDS) if x is not None)
+        if end > limit:
+            end = limit
+            fixed += 1
+        if end <= start:
+            end = start + 0.1  # a zero/negative-length cue never renders at all
         out.append(pysrt.SubRipItem(
-            index=i,
+            index=i + 1,
             start=pysrt.SubRipTime(seconds=start),
             end=pysrt.SubRipTime(seconds=end),
             text=text,
         ))
     out.save(path, encoding="utf-8")
+    return fixed
 
 
 def srt_to_vtt(srt_path: str) -> str:
@@ -1665,7 +1697,9 @@ def run_whisper_transcribe(job: dict, current_filepath: str, out_srt: str, task:
             msg = "whisper produced no cues (silent audio, or an unsupported/mismatched language hint)"
             log_line(f"[job {job_id}] ERROR: {msg}")
             return {"status": "error", "error": msg}
-        write_srt(cues, out_srt)
+        overstayed = write_srt(cues, out_srt)
+        if overstayed:
+            append_job_log(job_id, f"whisper[{task}]: shortened {overstayed} cue(s) that ran past the next line")
         append_job_log(job_id, f"whisper[{task}]: {len(cues)} cues -> {os.path.basename(out_srt)}")
         return {"status": "done", "path": out_srt, "cues": len(cues), "dropped": len(dropped)}
     except subprocess.CalledProcessError as e:
