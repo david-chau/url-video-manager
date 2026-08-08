@@ -15,6 +15,16 @@ A self-hosted queue for downloading videos and audio from YouTube and other site
 - **Vocal stripping** — optional, via [Demucs](https://github.com/facebookresearch/demucs). See [docs/DEPLOY.md](docs/DEPLOY.md).
 - **Cookies from the UI**, per-job file downloads, search/filter, and per-job logs.
 
+## Screenshots
+
+<img src="docs/screenshots/add-form.png" alt="The add form: URL box, download options, and the subtitle generation controls" width="900">
+
+Paste URLs or a playlist link, pick quality and container, and optionally have subtitles generated — Whisper or OCR, with a per-job model, a source language hint, and a translation target. Every option has an ⓘ that explains it in place.
+
+<img src="docs/screenshots/jobs-table.png" alt="The jobs table: a playlist parent with per-item rows, live progress, and per-job actions" width="900">
+
+The queue, live over SSE. A playlist collapses into a parent row that can generate or translate subtitles across every item at once; each item keeps its own actions — play in the browser, list files, regenerate subtitles, translate an existing track, re-download, or read the full log. Search and a status filter narrow the table as jobs run.
+
 ## Quick start
 
 ```bash
