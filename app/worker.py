@@ -505,10 +505,20 @@ def build_ydl_opts(job: dict, progress_hook=None, logger=None) -> dict:
     fmt = build_format(kind, job["quality"], container)
 
     if job.get("parent_id"):
+        # playlist_index only exists when yt-dlp is walking a playlist.
+        # These children are downloaded individually with noplaylist=True,
+        # so a bare %(playlist_index)03d rendered the literal "NA" into
+        # every filename in the season ("NA - Ep1", "NA - Ep2", ...).
+        # yt-dlp's &REPLACEMENT|DEFAULT syntax emits the padded prefix when
+        # the field is genuinely there and nothing at all when it isn't.
+        # playlist_title needs the same treatment for the same reason --
+        # without it these files land in a directory literally named "NA".
+        # An empty path component collapses harmlessly, so the file just
+        # sits in the downloads root when there's no playlist title.
         outtmpl = os.path.join(
             DOWNLOADS_DIR,
-            "%(playlist_title).100B",
-            "%(playlist_index)03d - %(title).150B [%(id)s].%(ext)s",
+            "%(playlist_title|).100B",
+            "%(playlist_index&{:03d} - |)s%(title).150B [%(id)s].%(ext)s",
         )
     else:
         outtmpl = os.path.join(DOWNLOADS_DIR, "%(title).150B [%(id)s].%(ext)s")

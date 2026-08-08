@@ -98,7 +98,22 @@ def test_p1_outtmpl_uses_id():
     assert "%(id)s" in opts_child["outtmpl"]
     assert "playlist_index" in opts_child["outtmpl"]
     assert opts_child["outtmpl"] != opts["outtmpl"]
-    print("ok: outtmpl distinguishes same-titled videos via %(id)s")
+
+    # A playlist child is fetched as a single video (noplaylist=True), so
+    # playlist_index is usually absent -- a bare %(playlist_index)03d wrote
+    # the literal "NA" into every filename in a season.
+    from yt_dlp import YoutubeDL
+    rendered = YoutubeDL({"outtmpl": opts_child["outtmpl"], "quiet": True})
+    without = rendered.prepare_filename({"title": "Ep", "id": "a", "ext": "mp4"})
+    with_ix = rendered.prepare_filename({"title": "Ep", "id": "a", "ext": "mp4", "playlist_index": 3})
+    assert "NA" not in without, f"missing index must vanish, not render as NA: {without}"
+    assert os.path.basename(without) == "Ep [a].mp4", without
+    assert os.path.basename(with_ix) == "003 - Ep [a].mp4", f"padded when present, for sort order: {with_ix}"
+    # Same for playlist_title, or every child lands in a directory named "NA".
+    titled = rendered.prepare_filename({"title": "Ep", "id": "a", "ext": "mp4", "playlist_title": "Season 1"})
+    assert os.path.basename(os.path.dirname(titled)) == "Season 1", titled
+    assert "NA" not in os.path.dirname(without), f"no playlist title must mean no folder: {without}"
+    print("ok: outtmpl distinguishes videos via %(id)s, and omits a missing playlist index")
 
 
 def test_p1_startup_recovery():
