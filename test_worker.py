@@ -907,6 +907,9 @@ def test_p9_regen_without_mux_leaves_video_untouched():
     assert row["status"] == "done", f"the job still completes, got {row['status']}"
     assert "left untouched" in (row["log"] or ""), "and says the video wasn't modified"
     assert os.path.exists(os.path.join(downloads, f"ep10.whisper-{worker.WHISPER_MODEL}.srt"))
+    # And that's the default -- regenerating subtitles must not rewrite the
+    # media unless it's asked for.
+    assert main.RegenSubsRequest().mux is False, "embedding must be opt-in"
     print("ok: regen with mux=False writes sidecars only, leaving the video byte-for-byte intact")
 
 

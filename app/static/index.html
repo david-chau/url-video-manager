@@ -452,7 +452,7 @@
     </div>
     <div class="controls">
       <label title="Muxing embeds the new track into the video file, rewriting it in place. Uncheck to only write the .srt files and leave the video byte-for-byte untouched -- the player and the Files list pick up sidecars either way, so embedding is a convenience.">
-        <input type="checkbox" id="regenMux" checked> embed into the video file
+        <input type="checkbox" id="regenMux"> embed into the video file
       </label>
       <span class="spacer"></span>
       <button id="regenModalRun" class="primary" type="button">Regenerate</button>
@@ -1228,7 +1228,10 @@ function applyRegenModeCopy() {
   // Re-download replaces the media anyway, so "leave the video untouched"
   // is meaningless there -- the video is being rebuilt from scratch.
   $('#regenMux').closest('label').style.display = redl ? 'none' : '';
-  if (redl) $('#regenMux').checked = true;
+  // Set explicitly on every open rather than left at whatever it was last
+  // time: off for regen (don't touch a working video), forced on for
+  // re-download (the media is being rebuilt anyway).
+  $('#regenMux').checked = redl;
   $('#regenModalRun').textContent = redl ? 'Re-download' : 'Regenerate';
   $('#regenModalHint').innerHTML = redl
     ? 'Deletes the downloaded video/audio and fetches it again, then generates subtitles in the same pass. Existing subtitle files are kept.'

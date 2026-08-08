@@ -149,10 +149,12 @@ class RegenSubsRequest(BaseModel):
     ocr_lang: str | None = None
     ocr_region: str | None = None
     whisper_model: str | None = None
-    # False writes the .srt sidecars and leaves the video file alone.
-    # Muxing rewrites the media in place, which is not what you want when
-    # you're only trying a different model on a file that's already fine.
-    mux: bool = True
+    # Defaults to False: regenerating subtitles should not rewrite the
+    # media. Muxing edits a file that is usually already correct, and the
+    # sidecars are picked up by the player and the Files list on their own,
+    # so embedding is a convenience worth opting into rather than the
+    # destructive default.
+    mux: bool = False
 
 
 class TranslateSubsRequest(BaseModel):
