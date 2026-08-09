@@ -1,0 +1,28 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"      # matches the Dockerfile
+          cache: pip
+
+      # The tests assert on ffmpeg argv rather than running it, but the app
+      # imports cleanly only with the tools it expects to find.
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Python deps
+        run: pip install -r requirements.txt
+
+      - name: Worker tests
+        run: python3 test_worker.py
