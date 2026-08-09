@@ -1,8 +1,9 @@
 name: checks
 
+# Pushes to main are already gated: publish.yml runs the same tests and its
+# build job needs them. This covers pull requests, which that workflow does
+# not trigger on.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 jobs:
